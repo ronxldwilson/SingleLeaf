@@ -12,16 +12,14 @@ import (
 )
 
 type Config struct {
-	Port         string
-	SearXNGURL   string
-	TorProxyURL  string
+	Port       string
+	SearXNGURL string
 }
 
 func loadConfig() Config {
 	return Config{
-		Port:        getEnv("SINGLE_LEAF_PORT", "8081"),
-		SearXNGURL:  getEnv("SEARXNG_URL", "http://searxng:8080"),
-		TorProxyURL: getEnv("TOR_PROXY_URL", "http://tor-proxy:3128"),
+		Port:       getEnv("SINGLE_LEAF_PORT", "8081"),
+		SearXNGURL: getEnv("SEARXNG_URL", "http://searxng:8080"),
 	}
 }
 
@@ -35,22 +33,8 @@ func getEnv(key, fallback string) string {
 func main() {
 	cfg := loadConfig()
 
-	proxyURL, err := url.Parse(cfg.TorProxyURL)
-	if err != nil {
-		log.Fatalf("invalid TOR_PROXY_URL: %v", err)
-	}
-
-	transport := &http.Transport{
-		Proxy:                 http.ProxyURL(proxyURL),
-		MaxIdleConns:          100,
-		IdleConnTimeout:       30 * time.Second,
-		DisableKeepAlives:     true,
-		ResponseHeaderTimeout: 60 * time.Second,
-	}
-
 	client := &http.Client{
-		Transport: transport,
-		Timeout:   90 * time.Second,
+		Timeout: 90 * time.Second,
 	}
 
 	mux := http.NewServeMux()
@@ -58,7 +42,7 @@ func main() {
 	mux.HandleFunc("/health", healthHandler)
 
 	log.Printf("single-leaf listening on :%s", cfg.Port)
-	log.Printf("searxng: %s | tor-proxy: %s", cfg.SearXNGURL, cfg.TorProxyURL)
+	log.Printf("searxng: %s", cfg.SearXNGURL)
 
 	if err := http.ListenAndServe(":"+cfg.Port, mux); err != nil {
 		log.Fatalf("server error: %v", err)
