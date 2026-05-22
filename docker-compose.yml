@@ -1,0 +1,42 @@
+services:
+  single-leaf:
+    build: .
+    ports:
+      - "8081:8081"
+    environment:
+      - SINGLE_LEAF_PORT=8081
+      - SEARXNG_URL=http://searxng:8080
+      - TOR_PROXY_URL=http://tor-proxy:3128
+    depends_on:
+      tor-proxy:
+        condition: service_healthy
+      searxng:
+        condition: service_started
+    restart: unless-stopped
+
+  tor-proxy:
+    image: ronxldwilson/tor-proxy-pool:latest
+    environment:
+      - TOR_INSTANCES=5
+      - TOR_REBUILD_INTERVAL=1800
+    ports:
+      - "3128:3128"
+      - "4444:4444"
+    restart: unless-stopped
+
+  searxng:
+    image: ronxldwilson/searxng-slim:latest
+    ports:
+      - "8080:8080"
+    environment:
+      - SEARXNG_PORT=8080
+    restart: unless-stopped
+
+  valkey:
+    image: valkey/valkey:9-alpine
+    volumes:
+      - valkey-data:/data
+    restart: unless-stopped
+
+volumes:
+  valkey-data:
