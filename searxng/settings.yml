@@ -63,22 +63,15 @@ search:
   #   - fr
   #   - fr-BE
   # ban time in seconds after engine errors
-  ban_time_on_fail: 5
-  # max ban time in seconds after engine errors
-  max_ban_time_on_fail: 120
+  ban_time_on_fail: 0
+  max_ban_time_on_fail: 0
   suspended_times:
-    # Engine suspension time after error (in seconds; set to 0 to disable)
-    # For error "Access denied" and "HTTP error [402, 403]"
-    SearxEngineAccessDenied: 180
-    # For error "CAPTCHA"
-    SearxEngineCaptcha: 3600
-    # For error "Too many request" and "HTTP error 429"
-    SearxEngineTooManyRequests: 180
-    # Cloudflare CAPTCHA
-    cf_SearxEngineCaptcha: 1296000
-    cf_SearxEngineAccessDenied: 86400
-    # ReCAPTCHA
-    recaptcha_SearxEngineCaptcha: 604800
+    SearxEngineAccessDenied: 0
+    SearxEngineCaptcha: 0
+    SearxEngineTooManyRequests: 0
+    cf_SearxEngineCaptcha: 0
+    cf_SearxEngineAccessDenied: 0
+    recaptcha_SearxEngineCaptcha: 0
 
   # remove format to deny access, use lower case.
   # formats: [html, csv, json, rss]

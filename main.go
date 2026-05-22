@@ -8,18 +8,29 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 )
 
 type Config struct {
 	Port       string
 	SearXNGURL string
+	FanOut     int
 }
 
 func loadConfig() Config {
+	fanOut := 5
+	if v := os.Getenv("SINGLE_LEAF_FANOUT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			fanOut = n
+		}
+	}
 	return Config{
 		Port:       getEnv("SINGLE_LEAF_PORT", "8081"),
 		SearXNGURL: getEnv("SEARXNG_URL", "http://searxng:8080"),
+		FanOut:     fanOut,
 	}
 }
 
@@ -28,6 +39,36 @@ func getEnv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+type fanResult struct {
+	resp *SearXNGResponse
+	err  error
+}
+
+type SearXNGResponse struct {
+	Query               string           `json:"query"`
+	NumberOfResults     int              `json:"number_of_results"`
+	Results             []SearXNGResult  `json:"results"`
+	Answers             []any            `json:"answers"`
+	Corrections         []any            `json:"corrections"`
+	Infoboxes           []any            `json:"infoboxes"`
+	Suggestions         []any            `json:"suggestions"`
+	UnresponsiveEngines []any            `json:"unresponsive_engines"`
+}
+
+type SearXNGResult struct {
+	URL           string   `json:"url"`
+	Title         string   `json:"title"`
+	Content       string   `json:"content"`
+	Engine        string   `json:"engine"`
+	Engines       []string `json:"engines"`
+	Score         float64  `json:"score"`
+	Category      string   `json:"category"`
+	PublishedDate any      `json:"publishedDate"`
+	Thumbnail     string   `json:"thumbnail,omitempty"`
+	ImgSrc        string   `json:"img_src,omitempty"`
+	Template      string   `json:"template,omitempty"`
 }
 
 func main() {
@@ -41,7 +82,7 @@ func main() {
 	mux.HandleFunc("/search", searchHandler(cfg, client))
 	mux.HandleFunc("/health", healthHandler)
 
-	log.Printf("single-leaf listening on :%s", cfg.Port)
+	log.Printf("single-leaf listening on :%s (fanout=%d)", cfg.Port, cfg.FanOut)
 	log.Printf("searxng: %s", cfg.SearXNGURL)
 
 	if err := http.ListenAndServe(":"+cfg.Port, mux); err != nil {
@@ -61,12 +102,6 @@ func searchHandler(cfg Config, client *http.Client) http.HandlerFunc {
 		lang := r.URL.Query().Get("lang")
 		pageno := r.URL.Query().Get("pageno")
 
-		searxURL, err := url.Parse(cfg.SearXNGURL + "/search")
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "bad searxng url"})
-			return
-		}
-
 		params := url.Values{}
 		params.Set("q", query)
 		params.Set("format", "json")
@@ -79,38 +114,178 @@ func searchHandler(cfg Config, client *http.Client) http.HandlerFunc {
 		if pageno != "" {
 			params.Set("pageno", pageno)
 		}
-		searxURL.RawQuery = params.Encode()
 
-		req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, searxURL.String(), nil)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to build request"})
-			return
-		}
-		req.Header.Set("Accept", "application/json")
+		searchURL := cfg.SearXNGURL + "/search?" + params.Encode()
 
 		start := time.Now()
-		resp, err := client.Do(req)
+
+		results := make([]fanResult, cfg.FanOut)
+		var wg sync.WaitGroup
+
+		for i := range cfg.FanOut {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, searchURL, nil)
+				if err != nil {
+					results[idx] = fanResult{err: err}
+					return
+				}
+				req.Header.Set("Accept", "application/json")
+
+				resp, err := client.Do(req)
+				if err != nil {
+					results[idx] = fanResult{err: err}
+					return
+				}
+				defer resp.Body.Close()
+
+				body, err := io.ReadAll(resp.Body)
+				if err != nil {
+					results[idx] = fanResult{err: err}
+					return
+				}
+
+				var parsed SearXNGResponse
+				if err := json.Unmarshal(body, &parsed); err != nil {
+					results[idx] = fanResult{err: err}
+					return
+				}
+				results[idx] = fanResult{resp: &parsed}
+			}(i)
+		}
+		wg.Wait()
+
+		merged := mergeResults(results, query)
 		elapsed := time.Since(start)
 
-		if err != nil {
-			log.Printf("searxng request failed (%v): %v", elapsed, err)
-			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "searxng request failed"})
+		successCount := 0
+		for _, fr := range results {
+			if fr.err == nil {
+				successCount++
+			}
+		}
+		log.Printf("query=%q fanout=%d/%d results=%d elapsed=%v", query, successCount, cfg.FanOut, len(merged.Results), elapsed)
+
+		if successCount == 0 {
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "all searxng requests failed"})
 			return
 		}
-		defer resp.Body.Close()
-
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "failed to read response"})
-			return
-		}
-
-		log.Printf("query=%q status=%d elapsed=%v", query, resp.StatusCode, elapsed)
 
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(resp.StatusCode)
-		w.Write(body)
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(merged)
 	}
+}
+
+func mergeResults(fanOutResults []fanResult, query string) SearXNGResponse {
+	seen := make(map[string]*SearXNGResult)
+	var ordered []string
+	seenAnswers := make(map[string]bool)
+	seenSuggestions := make(map[string]bool)
+	seenInfoboxIDs := make(map[string]bool)
+
+	merged := SearXNGResponse{
+		Query:   query,
+		Results: []SearXNGResult{},
+		Answers: []any{},
+		Corrections: []any{},
+		Infoboxes:   []any{},
+		Suggestions: []any{},
+		UnresponsiveEngines: []any{},
+	}
+
+	for _, fr := range fanOutResults {
+		if fr.err != nil || fr.resp == nil {
+			continue
+		}
+		r := fr.resp
+
+		for _, result := range r.Results {
+			normalizedURL := normalizeURL(result.URL)
+			if existing, ok := seen[normalizedURL]; ok {
+				existing.Score += result.Score
+				for _, eng := range result.Engines {
+					if !containsStr(existing.Engines, eng) {
+						existing.Engines = append(existing.Engines, eng)
+					}
+				}
+				if len(result.Content) > len(existing.Content) {
+					existing.Content = result.Content
+				}
+			} else {
+				dup := result
+				seen[normalizedURL] = &dup
+				ordered = append(ordered, normalizedURL)
+			}
+		}
+
+		for _, a := range r.Answers {
+			key := fmt.Sprintf("%v", a)
+			if !seenAnswers[key] {
+				seenAnswers[key] = true
+				merged.Answers = append(merged.Answers, a)
+			}
+		}
+
+		for _, s := range r.Suggestions {
+			key := fmt.Sprintf("%v", s)
+			if !seenSuggestions[key] {
+				seenSuggestions[key] = true
+				merged.Suggestions = append(merged.Suggestions, s)
+			}
+		}
+
+		for _, ib := range r.Infoboxes {
+			if m, ok := ib.(map[string]any); ok {
+				id := fmt.Sprintf("%v", m["id"])
+				if !seenInfoboxIDs[id] {
+					seenInfoboxIDs[id] = true
+					merged.Infoboxes = append(merged.Infoboxes, ib)
+				}
+			} else {
+				merged.Infoboxes = append(merged.Infoboxes, ib)
+			}
+		}
+
+		merged.Corrections = append(merged.Corrections, r.Corrections...)
+	}
+
+	for _, u := range ordered {
+		merged.Results = append(merged.Results, *seen[u])
+	}
+
+	// Sort by accumulated score descending
+	sortResultsByScore(merged.Results)
+
+	merged.NumberOfResults = len(merged.Results)
+	return merged
+}
+
+func sortResultsByScore(results []SearXNGResult) {
+	for i := 1; i < len(results); i++ {
+		for j := i; j > 0 && results[j].Score > results[j-1].Score; j-- {
+			results[j], results[j-1] = results[j-1], results[j]
+		}
+	}
+}
+
+func normalizeURL(rawURL string) string {
+	rawURL = strings.TrimRight(rawURL, "/")
+	rawURL = strings.TrimPrefix(rawURL, "https://www.")
+	rawURL = strings.TrimPrefix(rawURL, "http://www.")
+	rawURL = strings.TrimPrefix(rawURL, "https://")
+	rawURL = strings.TrimPrefix(rawURL, "http://")
+	return strings.ToLower(rawURL)
+}
+
+func containsStr(slice []string, s string) bool {
+	for _, v := range slice {
+		if v == s {
+			return true
+		}
+	}
+	return false
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
