@@ -15,9 +15,12 @@ import (
 )
 
 type Config struct {
-	Port       string
-	SearXNGURL string
-	FanOut     int
+	Port            string
+	SearXNGURL      string
+	FanOut          int
+	ZenPandaURL     string
+	DeepRenderCount int
+	DeepWaitMs      int
 }
 
 func loadConfig() Config {
@@ -27,10 +30,25 @@ func loadConfig() Config {
 			fanOut = n
 		}
 	}
+	renderCount := 5
+	if v := os.Getenv("DEEP_RENDER_COUNT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			renderCount = n
+		}
+	}
+	waitMs := 3000
+	if v := os.Getenv("DEEP_WAIT_MS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			waitMs = n
+		}
+	}
 	return Config{
-		Port:       getEnv("SINGLE_LEAF_PORT", "8081"),
-		SearXNGURL: getEnv("SEARXNG_URL", "http://searxng:8080"),
-		FanOut:     fanOut,
+		Port:            getEnv("SINGLE_LEAF_PORT", "8081"),
+		SearXNGURL:      getEnv("SEARXNG_URL", "http://searxng:8080"),
+		FanOut:          fanOut,
+		ZenPandaURL:     getEnv("ZENPANDA_URL", "http://zenpanda:9222"),
+		DeepRenderCount: renderCount,
+		DeepWaitMs:      waitMs,
 	}
 }
 
@@ -78,12 +96,15 @@ func main() {
 		Timeout: 90 * time.Second,
 	}
 
+	cdp := NewCDPClient(cfg.ZenPandaURL)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/search", searchHandler(cfg, client))
+	mux.HandleFunc("/deep-search", deepSearchHandler(cfg, client, cdp))
 	mux.HandleFunc("/health", healthHandler)
 
-	log.Printf("single-leaf listening on :%s (fanout=%d)", cfg.Port, cfg.FanOut)
-	log.Printf("searxng: %s", cfg.SearXNGURL)
+	log.Printf("single-leaf listening on :%s (fanout=%d, render=%d, wait=%dms)", cfg.Port, cfg.FanOut, cfg.DeepRenderCount, cfg.DeepWaitMs)
+	log.Printf("searxng: %s | zenpanda: %s", cfg.SearXNGURL, cfg.ZenPandaURL)
 
 	if err := http.ListenAndServe(":"+cfg.Port, mux); err != nil {
 		log.Fatalf("server error: %v", err)

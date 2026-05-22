@@ -1,0 +1,305 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"net/url"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/gorilla/websocket"
+)
+
+type CDPClient struct {
+	zenPandaURL string
+	httpClient  *http.Client
+}
+
+func NewCDPClient(zenPandaURL string) *CDPClient {
+	return &CDPClient{
+		zenPandaURL: zenPandaURL,
+		httpClient:  &http.Client{Timeout: 10 * time.Second},
+	}
+}
+
+type cdpTarget struct {
+	ID                 string `json:"id"`
+	WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
+}
+
+type cdpMessage struct {
+	ID     int             `json:"id"`
+	Method string          `json:"method,omitempty"`
+	Params json.RawMessage `json:"params,omitempty"`
+	Result json.RawMessage `json:"result,omitempty"`
+	Error  *cdpError       `json:"error,omitempty"`
+}
+
+type cdpError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+func (c *CDPClient) FetchPage(ctx context.Context, targetURL string, waitMs int) (string, error) {
+	wsURL, err := c.createTarget(ctx)
+	if err != nil {
+		return "", fmt.Errorf("create target: %w", err)
+	}
+
+	conn, _, err := websocket.DefaultDialer.DialContext(ctx, wsURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("ws connect: %w", err)
+	}
+	defer conn.Close()
+
+	var msgID atomic.Int64
+
+	sendCmd := func(method string, params any) (json.RawMessage, error) {
+		id := int(msgID.Add(1))
+		p, _ := json.Marshal(params)
+		msg := cdpMessage{ID: id, Method: method, Params: p}
+		if err := conn.WriteJSON(msg); err != nil {
+			return nil, err
+		}
+		for {
+			var resp cdpMessage
+			if err := conn.ReadJSON(&resp); err != nil {
+				return nil, err
+			}
+			if resp.ID == id {
+				if resp.Error != nil {
+					return nil, fmt.Errorf("cdp error %d: %s", resp.Error.Code, resp.Error.Message)
+				}
+				return resp.Result, nil
+			}
+		}
+	}
+
+	if _, err := sendCmd("Page.enable", nil); err != nil {
+		return "", err
+	}
+
+	if _, err := sendCmd("Page.navigate", map[string]string{"url": targetURL}); err != nil {
+		return "", err
+	}
+
+	time.Sleep(time.Duration(waitMs) * time.Millisecond)
+
+	result, err := sendCmd("Runtime.evaluate", map[string]any{
+		"expression":    "document.body ? document.body.innerText : ''",
+		"returnByValue": true,
+	})
+	if err != nil {
+		return "", err
+	}
+
+	var evalResult struct {
+		Result struct {
+			Value string `json:"value"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(result, &evalResult); err != nil {
+		return "", err
+	}
+
+	sendCmd("Target.closeTarget", map[string]string{"targetId": ""})
+
+	return evalResult.Result.Value, nil
+}
+
+func (c *CDPClient) createTarget(ctx context.Context) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.zenPandaURL+"/json/new?about:blank", nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	var target cdpTarget
+	if err := json.Unmarshal(body, &target); err != nil {
+		return "", err
+	}
+
+	if target.WebSocketDebuggerURL == "" {
+		return "", fmt.Errorf("no websocket url in target response")
+	}
+	return target.WebSocketDebuggerURL, nil
+}
+
+func (c *CDPClient) Healthy(ctx context.Context) bool {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.zenPandaURL+"/json/health", nil)
+	if err != nil {
+		return false
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
+type DeepResult struct {
+	URL         string `json:"url"`
+	Title       string `json:"title"`
+	Content     string `json:"content"`
+	PageText    string `json:"page_text"`
+	Engine      string `json:"engine,omitempty"`
+	Engines     []string `json:"engines,omitempty"`
+	Score       float64  `json:"score"`
+	Category    string `json:"category,omitempty"`
+	RenderTimeMs int64  `json:"render_time_ms"`
+	RenderError string `json:"render_error,omitempty"`
+}
+
+type DeepSearchResponse struct {
+	Query           string       `json:"query"`
+	TotalResults    int          `json:"total_results"`
+	RenderedResults int          `json:"rendered_results"`
+	Results         []DeepResult `json:"results"`
+	ElapsedMs       int64        `json:"elapsed_ms"`
+}
+
+func deepSearchHandler(cfg Config, client *http.Client, cdp *CDPClient) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query().Get("q")
+		if query == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing query parameter 'q'"})
+			return
+		}
+
+		renderCount := cfg.DeepRenderCount
+		if v := r.URL.Query().Get("render"); v != "" {
+			var n int
+			if _, err := fmt.Sscanf(v, "%d", &n); err == nil && n > 0 {
+				renderCount = n
+			}
+		}
+
+		categories := r.URL.Query().Get("categories")
+		lang := r.URL.Query().Get("lang")
+		pageno := r.URL.Query().Get("pageno")
+
+		params := fmt.Sprintf("q=%s&format=json", urlEncode(query))
+		if categories != "" {
+			params += "&categories=" + urlEncode(categories)
+		}
+		if lang != "" {
+			params += "&language=" + urlEncode(lang)
+		}
+		if pageno != "" {
+			params += "&pageno=" + urlEncode(pageno)
+		}
+
+		searchURL := cfg.SearXNGURL + "/search?" + params
+		start := time.Now()
+
+		results := make([]fanResult, cfg.FanOut)
+		var wg sync.WaitGroup
+		for i := range cfg.FanOut {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, searchURL, nil)
+				if err != nil {
+					results[idx] = fanResult{err: err}
+					return
+				}
+				req.Header.Set("Accept", "application/json")
+				resp, err := client.Do(req)
+				if err != nil {
+					results[idx] = fanResult{err: err}
+					return
+				}
+				defer resp.Body.Close()
+				body, err := io.ReadAll(resp.Body)
+				if err != nil {
+					results[idx] = fanResult{err: err}
+					return
+				}
+				var parsed SearXNGResponse
+				if err := json.Unmarshal(body, &parsed); err != nil {
+					results[idx] = fanResult{err: err}
+					return
+				}
+				results[idx] = fanResult{resp: &parsed}
+			}(i)
+		}
+		wg.Wait()
+
+		merged := mergeResults(results, query)
+
+		toRender := merged.Results
+		if len(toRender) > renderCount {
+			toRender = toRender[:renderCount]
+		}
+
+		deepResults := make([]DeepResult, len(toRender))
+		var renderWg sync.WaitGroup
+		for i, sr := range toRender {
+			deepResults[i] = DeepResult{
+				URL:      sr.URL,
+				Title:    sr.Title,
+				Content:  sr.Content,
+				Engines:  sr.Engines,
+				Score:    sr.Score,
+				Category: sr.Category,
+			}
+			renderWg.Add(1)
+			go func(idx int, pageURL string) {
+				defer renderWg.Done()
+				renderStart := time.Now()
+				ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+				defer cancel()
+
+				text, err := cdp.FetchPage(ctx, pageURL, cfg.DeepWaitMs)
+				deepResults[idx].RenderTimeMs = time.Since(renderStart).Milliseconds()
+				if err != nil {
+					deepResults[idx].RenderError = err.Error()
+					return
+				}
+				if len(text) > 50000 {
+					text = text[:50000]
+				}
+				deepResults[idx].PageText = text
+			}(i, sr.URL)
+		}
+		renderWg.Wait()
+
+		rendered := 0
+		for _, dr := range deepResults {
+			if dr.PageText != "" {
+				rendered++
+			}
+		}
+
+		elapsed := time.Since(start)
+		log.Printf("deep-search query=%q search_results=%d rendered=%d/%d elapsed=%v",
+			query, len(merged.Results), rendered, len(toRender), elapsed)
+
+		writeJSON(w, http.StatusOK, DeepSearchResponse{
+			Query:           query,
+			TotalResults:    len(merged.Results),
+			RenderedResults: rendered,
+			Results:         deepResults,
+			ElapsedMs:       elapsed.Milliseconds(),
+		})
+	}
+}
+
+func urlEncode(s string) string {
+	return url.QueryEscape(s)
+}

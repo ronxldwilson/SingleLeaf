@@ -6,11 +6,22 @@ services:
     environment:
       - SINGLE_LEAF_PORT=8081
       - SEARXNG_URL=http://searxng:8080
+      - ZENPANDA_URL=http://zenpanda:9222
+      - DEEP_RENDER_COUNT=5
+      - DEEP_WAIT_MS=3000
     depends_on:
       tor-proxy:
         condition: service_healthy
       searxng:
         condition: service_started
+      zenpanda:
+        condition: service_started
+    restart: unless-stopped
+
+  zenpanda:
+    image: ronxldwilson/zenpanda:latest
+    ports:
+      - "9222:9222"
     restart: unless-stopped
 
   tor-proxy:
