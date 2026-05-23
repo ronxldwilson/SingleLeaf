@@ -45,13 +45,13 @@ func loadConfig() Config {
 			waitMs = n
 		}
 	}
-	deepTimeoutMs := 10000
+	deepTimeoutMs := 15000
 	if v := os.Getenv("DEEP_TIMEOUT_MS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			deepTimeoutMs = n
 		}
 	}
-	searchTimeoutMs := 7000
+	searchTimeoutMs := 8000
 	if v := os.Getenv("SEARCH_TIMEOUT_MS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			searchTimeoutMs = n
@@ -116,6 +116,7 @@ func main() {
 	cdp := NewCDPClient(cfg.ZenPandaURL)
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/", uiHandler)
 	mux.HandleFunc("/search", searchHandler(cfg, client))
 	mux.HandleFunc("/deep-search", deepSearchHandler(cfg, client, cdp))
 	mux.HandleFunc("/health", healthHandler)
@@ -207,14 +208,37 @@ func searchHandler(cfg Config, client *http.Client) http.HandlerFunc {
 		wg.Wait()
 
 		merged := mergeResults(results, query)
-		elapsed := time.Since(start)
 
+		// Retry once with a single request if all fanout failed
 		successCount := 0
 		for _, fr := range results {
 			if fr.err == nil {
 				successCount++
 			}
 		}
+		if len(merged.Results) == 0 && successCount == 0 {
+			slog.Info("all fanout failed, retrying with single request", "query", query)
+			retryCtx, retryCancel := context.WithTimeout(r.Context(), time.Duration(cfg.SearchTimeoutMs)*time.Millisecond)
+			defer retryCancel()
+			req, err := http.NewRequestWithContext(retryCtx, http.MethodGet, searchURL, nil)
+			if err == nil {
+				req.Header.Set("Accept", "application/json")
+				resp, err := client.Do(req)
+				if err == nil {
+					defer resp.Body.Close()
+					body, err := io.ReadAll(resp.Body)
+					if err == nil {
+						var parsed SearXNGResponse
+						if json.Unmarshal(body, &parsed) == nil {
+							merged = parsed
+							successCount = 1
+						}
+					}
+				}
+			}
+		}
+
+		elapsed := time.Since(start)
 		slog.Info("search completed",
 			"query", query,
 			"fanout_ok", successCount,

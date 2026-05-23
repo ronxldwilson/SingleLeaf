@@ -10,8 +10,8 @@ services:
       - ZENPANDA_URL=http://zenpanda:9222
       - DEEP_RENDER_COUNT=10
       - DEEP_WAIT_MS=1500
-      - DEEP_TIMEOUT_MS=10000
-      - SEARCH_TIMEOUT_MS=7000
+      - DEEP_TIMEOUT_MS=15000
+      - SEARCH_TIMEOUT_MS=8000
     depends_on:
       tor-proxy:
         condition: service_healthy

@@ -251,32 +251,48 @@ func deepSearchHandler(cfg Config, client *http.Client, cdp *CDPClient) http.Han
 		overallCtx, overallCancel := context.WithTimeout(r.Context(), time.Duration(cfg.DeepTimeoutMs)*time.Millisecond)
 		defer overallCancel()
 
-		searchDeadline := time.Duration(cfg.SearchTimeoutMs) * time.Millisecond
-		searchCtx, searchCancel := context.WithTimeout(overallCtx, searchDeadline)
-		defer searchCancel()
+		doSearch := func() (*SearXNGResponse, error) {
+			searchCtx, searchCancel := context.WithTimeout(overallCtx, time.Duration(cfg.SearchTimeoutMs)*time.Millisecond)
+			defer searchCancel()
 
-		req, err := http.NewRequestWithContext(searchCtx, http.MethodGet, searchURL, nil)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create request"})
-			return
+			req, err := http.NewRequestWithContext(searchCtx, http.MethodGet, searchURL, nil)
+			if err != nil {
+				return nil, err
+			}
+			req.Header.Set("Accept", "application/json")
+			resp, err := client.Do(req)
+			if err != nil {
+				return nil, err
+			}
+			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				return nil, err
+			}
+			var parsed SearXNGResponse
+			if err := json.Unmarshal(body, &parsed); err != nil {
+				return nil, err
+			}
+			return &parsed, nil
 		}
-		req.Header.Set("Accept", "application/json")
-		resp, err := client.Do(req)
+
+		result, err := doSearch()
 		if err != nil {
 			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "searxng request failed"})
 			return
 		}
-		defer resp.Body.Close()
-		body, readErr := io.ReadAll(resp.Body)
-		if readErr != nil {
-			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "failed to read searxng response"})
-			return
+
+		// Retry once if 0 results and we have enough time for retry + rendering
+		searchElapsed := time.Since(start)
+		remainingMs := int64(cfg.DeepTimeoutMs) - searchElapsed.Milliseconds()
+		if len(result.Results) == 0 && remainingMs > int64(cfg.SearchTimeoutMs) {
+			slog.Info("search returned 0 results, retrying", "query", query, "remaining_ms", remainingMs)
+			if retry, err := doSearch(); err == nil && len(retry.Results) > 0 {
+				result = retry
+			}
 		}
-		var merged SearXNGResponse
-		if err := json.Unmarshal(body, &merged); err != nil {
-			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "invalid searxng response"})
-			return
-		}
+
+		merged := *result
 
 		toRender := merged.Results
 		if len(toRender) > renderCount {
