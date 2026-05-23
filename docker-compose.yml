@@ -1,5 +1,6 @@
 services:
   single-leaf:
+    image: ronxldwilson/single-leaf:latest
     build: .
     ports:
       - "8081:8081"
