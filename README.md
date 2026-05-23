@@ -21,9 +21,76 @@ SingleLeaf is a Go service that fans out search queries through [SearXNG](https:
 
 ## Quick Start
 
+### Option 1: Clone and run
+
 ```bash
+git clone https://github.com/ronxldwilson/SingleLeaf.git
+cd SingleLeaf
 docker compose up -d
 ```
+
+### Option 2: Run from Docker Hub (no clone needed)
+
+All images are published to Docker Hub with multi-arch support (amd64 + arm64):
+
+| Image | Description |
+|---|---|
+| [`ronxldwilson/single-leaf`](https://hub.docker.com/r/ronxldwilson/single-leaf) | Search aggregator + deep renderer |
+| [`ronxldwilson/zenpanda`](https://hub.docker.com/r/ronxldwilson/zenpanda) | Headless Chromium browser (CDP) |
+| [`ronxldwilson/searxng-slim`](https://hub.docker.com/r/ronxldwilson/searxng-slim) | SearXNG metasearch engine |
+| [`ronxldwilson/tor-proxy-pool`](https://hub.docker.com/r/ronxldwilson/tor-proxy-pool) | Rotating Tor proxy pool |
+
+Save this as `docker-compose.yml` and run `docker compose up -d`:
+
+```yaml
+services:
+  single-leaf:
+    image: ronxldwilson/single-leaf:latest
+    ports:
+      - "8081:8081"
+    environment:
+      - SEARXNG_URL=http://searxng:8080
+      - ZENPANDA_URL=http://zenpanda:9222
+      - DEEP_RENDER_COUNT=10
+      - DEEP_TIMEOUT_MS=10000
+      - SEARCH_TIMEOUT_MS=7000
+    depends_on:
+      tor-proxy:
+        condition: service_healthy
+      searxng:
+        condition: service_started
+      zenpanda:
+        condition: service_started
+    restart: unless-stopped
+
+  zenpanda:
+    image: ronxldwilson/zenpanda:latest
+    ports:
+      - "9222:9222"
+    restart: unless-stopped
+
+  tor-proxy:
+    image: ronxldwilson/tor-proxy-pool:latest
+    environment:
+      - TOR_INSTANCES=100
+      - TOR_REBUILD_INTERVAL=1800
+    ports:
+      - "3128:3128"
+      - "4444:4444"
+    restart: unless-stopped
+
+  searxng:
+    image: ronxldwilson/searxng-slim:latest
+    ports:
+      - "8080:8080"
+    depends_on:
+      - tor-proxy
+    restart: unless-stopped
+```
+
+> **Note:** The standalone compose above uses SearXNG's default settings. For the full 40+ engine configuration with Tor proxy routing and tuned timeouts, clone the repo to get `searxng/settings.yml`.
+
+### Try it out
 
 ```bash
 # Search
