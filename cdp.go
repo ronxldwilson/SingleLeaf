@@ -5,9 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -27,17 +28,13 @@ func NewCDPClient(zenPandaURL string) *CDPClient {
 	}
 }
 
-type cdpTarget struct {
-	ID                 string `json:"id"`
-	WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
-}
-
 type cdpMessage struct {
-	ID     int             `json:"id"`
-	Method string          `json:"method,omitempty"`
-	Params json.RawMessage `json:"params,omitempty"`
-	Result json.RawMessage `json:"result,omitempty"`
-	Error  *cdpError       `json:"error,omitempty"`
+	ID        int             `json:"id"`
+	Method    string          `json:"method,omitempty"`
+	Params    json.RawMessage `json:"params,omitempty"`
+	Result    json.RawMessage `json:"result,omitempty"`
+	Error     *cdpError       `json:"error,omitempty"`
+	SessionID string          `json:"sessionId,omitempty"`
 }
 
 type cdpError struct {
@@ -45,13 +42,14 @@ type cdpError struct {
 	Message string `json:"message"`
 }
 
-func (c *CDPClient) FetchPage(ctx context.Context, targetURL string, waitMs int) (string, error) {
-	wsURL, err := c.createTarget(ctx)
-	if err != nil {
-		return "", fmt.Errorf("create target: %w", err)
-	}
+func (c *CDPClient) browserWSURL() string {
+	u := strings.TrimPrefix(c.zenPandaURL, "http://")
+	u = strings.TrimPrefix(u, "https://")
+	return "ws://" + u + "/"
+}
 
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, wsURL, nil)
+func (c *CDPClient) FetchPage(ctx context.Context, targetURL string, waitMs int) (string, error) {
+	conn, _, err := websocket.DefaultDialer.DialContext(ctx, c.browserWSURL(), nil)
 	if err != nil {
 		return "", fmt.Errorf("ws connect: %w", err)
 	}
@@ -59,10 +57,10 @@ func (c *CDPClient) FetchPage(ctx context.Context, targetURL string, waitMs int)
 
 	var msgID atomic.Int64
 
-	sendCmd := func(method string, params any) (json.RawMessage, error) {
+	sendCmd := func(method string, params any, sessionID string) (json.RawMessage, error) {
 		id := int(msgID.Add(1))
 		p, _ := json.Marshal(params)
-		msg := cdpMessage{ID: id, Method: method, Params: p}
+		msg := cdpMessage{ID: id, Method: method, Params: p, SessionID: sessionID}
 		if err := conn.WriteJSON(msg); err != nil {
 			return nil, err
 		}
@@ -80,12 +78,30 @@ func (c *CDPClient) FetchPage(ctx context.Context, targetURL string, waitMs int)
 		}
 	}
 
-	if _, err := sendCmd("Page.enable", nil); err != nil {
-		return "", err
+	createResult, err := sendCmd("Target.createTarget", map[string]string{"url": "about:blank"}, "")
+	if err != nil {
+		return "", fmt.Errorf("create target: %w", err)
 	}
+	var created struct {
+		TargetID string `json:"targetId"`
+	}
+	json.Unmarshal(createResult, &created)
+	targetID := created.TargetID
 
-	if _, err := sendCmd("Page.navigate", map[string]string{"url": targetURL}); err != nil {
-		return "", err
+	attachResult, err := sendCmd("Target.attachToTarget", map[string]any{"targetId": targetID, "flatten": true}, "")
+	if err != nil {
+		sendCmd("Target.closeTarget", map[string]string{"targetId": targetID}, "")
+		return "", fmt.Errorf("attach target: %w", err)
+	}
+	var attached struct {
+		SessionID string `json:"sessionId"`
+	}
+	json.Unmarshal(attachResult, &attached)
+	sid := attached.SessionID
+
+	if _, err := sendCmd("Page.navigate", map[string]string{"url": targetURL}, sid); err != nil {
+		sendCmd("Target.closeTarget", map[string]string{"targetId": targetID}, "")
+		return "", fmt.Errorf("navigate: %w", err)
 	}
 
 	time.Sleep(time.Duration(waitMs) * time.Millisecond)
@@ -93,9 +109,10 @@ func (c *CDPClient) FetchPage(ctx context.Context, targetURL string, waitMs int)
 	result, err := sendCmd("Runtime.evaluate", map[string]any{
 		"expression":    "document.body ? document.body.innerText : ''",
 		"returnByValue": true,
-	})
+	}, sid)
 	if err != nil {
-		return "", err
+		sendCmd("Target.closeTarget", map[string]string{"targetId": targetID}, "")
+		return "", fmt.Errorf("evaluate: %w", err)
 	}
 
 	var evalResult struct {
@@ -104,39 +121,13 @@ func (c *CDPClient) FetchPage(ctx context.Context, targetURL string, waitMs int)
 		} `json:"result"`
 	}
 	if err := json.Unmarshal(result, &evalResult); err != nil {
+		sendCmd("Target.closeTarget", map[string]string{"targetId": targetID}, "")
 		return "", err
 	}
 
-	sendCmd("Target.closeTarget", map[string]string{"targetId": ""})
+	sendCmd("Target.closeTarget", map[string]string{"targetId": targetID}, "")
 
 	return evalResult.Result.Value, nil
-}
-
-func (c *CDPClient) createTarget(ctx context.Context) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.zenPandaURL+"/json/new?about:blank", nil)
-	if err != nil {
-		return "", err
-	}
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	var target cdpTarget
-	if err := json.Unmarshal(body, &target); err != nil {
-		return "", err
-	}
-
-	if target.WebSocketDebuggerURL == "" {
-		return "", fmt.Errorf("no websocket url in target response")
-	}
-	return target.WebSocketDebuggerURL, nil
 }
 
 func (c *CDPClient) Healthy(ctx context.Context) bool {
@@ -287,8 +278,13 @@ func deepSearchHandler(cfg Config, client *http.Client, cdp *CDPClient) http.Han
 		}
 
 		elapsed := time.Since(start)
-		log.Printf("deep-search query=%q search_results=%d rendered=%d/%d elapsed=%v",
-			query, len(merged.Results), rendered, len(toRender), elapsed)
+		slog.Info("deep-search completed",
+			"query", query,
+			"search_results", len(merged.Results),
+			"rendered_ok", rendered,
+			"rendered_total", len(toRender),
+			"elapsed_ms", elapsed.Milliseconds(),
+		)
 
 		writeJSON(w, http.StatusOK, DeepSearchResponse{
 			Query:           query,

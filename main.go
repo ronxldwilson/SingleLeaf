@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -103,11 +103,20 @@ func main() {
 	mux.HandleFunc("/deep-search", deepSearchHandler(cfg, client, cdp))
 	mux.HandleFunc("/health", healthHandler)
 
-	log.Printf("single-leaf listening on :%s (fanout=%d, render=%d, wait=%dms)", cfg.Port, cfg.FanOut, cfg.DeepRenderCount, cfg.DeepWaitMs)
-	log.Printf("searxng: %s | zenpanda: %s", cfg.SearXNGURL, cfg.ZenPandaURL)
+	slog.Info("single-leaf starting",
+		"port", cfg.Port,
+		"fanout", cfg.FanOut,
+		"render_count", cfg.DeepRenderCount,
+		"wait_ms", cfg.DeepWaitMs,
+	)
+	slog.Info("upstream services",
+		"searxng", cfg.SearXNGURL,
+		"zenpanda", cfg.ZenPandaURL,
+	)
 
 	if err := http.ListenAndServe(":"+cfg.Port, mux); err != nil {
-		log.Fatalf("server error: %v", err)
+		slog.Error("server failed", "error", err)
+		os.Exit(1)
 	}
 }
 
@@ -186,7 +195,13 @@ func searchHandler(cfg Config, client *http.Client) http.HandlerFunc {
 				successCount++
 			}
 		}
-		log.Printf("query=%q fanout=%d/%d results=%d elapsed=%v", query, successCount, cfg.FanOut, len(merged.Results), elapsed)
+		slog.Info("search completed",
+			"query", query,
+			"fanout_ok", successCount,
+			"fanout_total", cfg.FanOut,
+			"results", len(merged.Results),
+			"elapsed_ms", elapsed.Milliseconds(),
+		)
 
 		if successCount == 0 {
 			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "all searxng requests failed"})
@@ -292,12 +307,13 @@ func sortResultsByScore(results []SearXNGResult) {
 }
 
 func normalizeURL(rawURL string) string {
+	rawURL = strings.ToLower(rawURL)
 	rawURL = strings.TrimRight(rawURL, "/")
 	rawURL = strings.TrimPrefix(rawURL, "https://www.")
 	rawURL = strings.TrimPrefix(rawURL, "http://www.")
 	rawURL = strings.TrimPrefix(rawURL, "https://")
 	rawURL = strings.TrimPrefix(rawURL, "http://")
-	return strings.ToLower(rawURL)
+	return rawURL
 }
 
 func containsStr(slice []string, s string) bool {
@@ -320,7 +336,9 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 func init() {
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	})))
 	fmt.Println(`
      _             _          _            __
  ___(_)_ __   __ _| | ___    | | ___  __ _ / _|
