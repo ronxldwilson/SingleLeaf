@@ -13,8 +13,47 @@ import (
 	"sync/atomic"
 	"time"
 
+	"regexp"
+
 	"github.com/gorilla/websocket"
 )
+
+var htmlTagRe = regexp.MustCompile(`<[^>]*>`)
+var whitespaceRe = regexp.MustCompile(`\s+`)
+
+func httpFetchText(ctx context.Context, client *http.Client, pageURL string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pageURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; SingleLeaf/1.0)")
+	req.Header.Set("Accept", "text/html")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 200_000))
+	if err != nil {
+		return "", err
+	}
+
+	html := string(body)
+
+	// Remove script and style blocks
+	for _, tag := range []string{"script", "style", "noscript"} {
+		re := regexp.MustCompile(`(?is)<` + tag + `[^>]*>.*?</` + tag + `>`)
+		html = re.ReplaceAllString(html, " ")
+	}
+
+	text := htmlTagRe.ReplaceAllString(html, " ")
+	text = whitespaceRe.ReplaceAllString(text, " ")
+	text = strings.TrimSpace(text)
+
+	return text, nil
+}
 
 type CDPClient struct {
 	zenPandaURL string
@@ -154,16 +193,17 @@ func (c *CDPClient) Healthy(ctx context.Context) bool {
 }
 
 type DeepResult struct {
-	URL         string `json:"url"`
-	Title       string `json:"title"`
-	Content     string `json:"content"`
-	PageText    string `json:"page_text"`
-	Engine      string `json:"engine,omitempty"`
-	Engines     []string `json:"engines,omitempty"`
-	Score       float64  `json:"score"`
-	Category    string `json:"category,omitempty"`
-	RenderTimeMs int64  `json:"render_time_ms"`
-	RenderError string `json:"render_error,omitempty"`
+	URL          string   `json:"url"`
+	Title        string   `json:"title"`
+	Content      string   `json:"content"`
+	PageText     string   `json:"page_text"`
+	Engine       string   `json:"engine,omitempty"`
+	Engines      []string `json:"engines,omitempty"`
+	Score        float64  `json:"score"`
+	Category     string   `json:"category,omitempty"`
+	RenderTimeMs int64    `json:"render_time_ms"`
+	RenderSource string   `json:"render_source,omitempty"`
+	RenderError  string   `json:"render_error,omitempty"`
 }
 
 type DeepSearchResponse struct {
@@ -244,7 +284,7 @@ func deepSearchHandler(cfg Config, client *http.Client, cdp *CDPClient) http.Han
 		}
 
 		deepResults := make([]DeepResult, len(toRender))
-		sem := make(chan struct{}, 2)
+		cdpSem := make(chan struct{}, 2)
 
 		var renderWg sync.WaitGroup
 		for i, sr := range toRender {
@@ -259,25 +299,85 @@ func deepSearchHandler(cfg Config, client *http.Client, cdp *CDPClient) http.Han
 			renderWg.Add(1)
 			go func(idx int, pageURL string) {
 				defer renderWg.Done()
-				select {
-				case sem <- struct{}{}:
-					defer func() { <-sem }()
-				case <-overallCtx.Done():
-					deepResults[idx].RenderError = "render deadline exceeded"
-					return
-				}
 				renderStart := time.Now()
 
-				text, err := cdp.FetchPage(overallCtx, pageURL, cfg.DeepWaitMs)
+				type fetchResult struct {
+					text   string
+					source string
+				}
+				resultCh := make(chan fetchResult, 2)
+
+				// HTTP fetch — fast, plain text extraction
+				go func() {
+					text, err := httpFetchText(overallCtx, client, pageURL)
+					if err != nil || len(strings.TrimSpace(text)) < 200 {
+						resultCh <- fetchResult{}
+						return
+					}
+					if len(text) > 50000 {
+						text = text[:50000]
+					}
+					resultCh <- fetchResult{text: text, source: "fetch"}
+				}()
+
+				// CDP render — slower but handles JS-rendered pages
+				go func() {
+					select {
+					case cdpSem <- struct{}{}:
+						defer func() { <-cdpSem }()
+					case <-overallCtx.Done():
+						resultCh <- fetchResult{}
+						return
+					}
+					text, err := cdp.FetchPage(overallCtx, pageURL, cfg.DeepWaitMs)
+					if err != nil || len(strings.TrimSpace(text)) < 50 {
+						resultCh <- fetchResult{}
+						return
+					}
+					if len(text) > 50000 {
+						text = text[:50000]
+					}
+					resultCh <- fetchResult{text: text, source: "cdp"}
+				}()
+
+				// Take whichever arrives first with good data
+				var best fetchResult
+				for received := 0; received < 2; received++ {
+					select {
+					case r := <-resultCh:
+						if r.text != "" && best.text == "" {
+							best = r
+							// If HTTP fetch won with enough content, don't wait for CDP
+							if r.source == "fetch" && len(r.text) >= 500 {
+								deepResults[idx].RenderTimeMs = time.Since(renderStart).Milliseconds()
+								deepResults[idx].PageText = r.text
+								deepResults[idx].RenderSource = r.source
+								return
+							}
+						}
+						// If CDP came back with more content, upgrade
+						if r.text != "" && r.source == "cdp" && len(r.text) > len(best.text) {
+							best = r
+						}
+					case <-overallCtx.Done():
+						deepResults[idx].RenderTimeMs = time.Since(renderStart).Milliseconds()
+						if best.text != "" {
+							deepResults[idx].PageText = best.text
+							deepResults[idx].RenderSource = best.source
+						} else {
+							deepResults[idx].RenderError = "render deadline exceeded"
+						}
+						return
+					}
+				}
+
 				deepResults[idx].RenderTimeMs = time.Since(renderStart).Milliseconds()
-				if err != nil {
-					deepResults[idx].RenderError = err.Error()
-					return
+				if best.text != "" {
+					deepResults[idx].PageText = best.text
+					deepResults[idx].RenderSource = best.source
+				} else {
+					deepResults[idx].RenderError = "no usable content from fetch or render"
 				}
-				if len(text) > 50000 {
-					text = text[:50000]
-				}
-				deepResults[idx].PageText = text
 			}(i, sr.URL)
 		}
 		renderWg.Wait()
