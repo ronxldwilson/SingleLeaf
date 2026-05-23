@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -21,6 +22,8 @@ type Config struct {
 	ZenPandaURL     string
 	DeepRenderCount int
 	DeepWaitMs      int
+	DeepTimeoutMs   int
+	SearchTimeoutMs int
 }
 
 func loadConfig() Config {
@@ -30,16 +33,28 @@ func loadConfig() Config {
 			fanOut = n
 		}
 	}
-	renderCount := 5
+	renderCount := 10
 	if v := os.Getenv("DEEP_RENDER_COUNT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			renderCount = n
 		}
 	}
-	waitMs := 3000
+	waitMs := 2000
 	if v := os.Getenv("DEEP_WAIT_MS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			waitMs = n
+		}
+	}
+	deepTimeoutMs := 10000
+	if v := os.Getenv("DEEP_TIMEOUT_MS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			deepTimeoutMs = n
+		}
+	}
+	searchTimeoutMs := 7000
+	if v := os.Getenv("SEARCH_TIMEOUT_MS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			searchTimeoutMs = n
 		}
 	}
 	return Config{
@@ -49,6 +64,8 @@ func loadConfig() Config {
 		ZenPandaURL:     getEnv("ZENPANDA_URL", "http://zenpanda:9222"),
 		DeepRenderCount: renderCount,
 		DeepWaitMs:      waitMs,
+		DeepTimeoutMs:   deepTimeoutMs,
+		SearchTimeoutMs: searchTimeoutMs,
 	}
 }
 
@@ -108,6 +125,7 @@ func main() {
 		"fanout", cfg.FanOut,
 		"render_count", cfg.DeepRenderCount,
 		"wait_ms", cfg.DeepWaitMs,
+		"deep_timeout_ms", cfg.DeepTimeoutMs,
 	)
 	slog.Info("upstream services",
 		"searxng", cfg.SearXNGURL,
@@ -148,6 +166,8 @@ func searchHandler(cfg Config, client *http.Client) http.HandlerFunc {
 		searchURL := cfg.SearXNGURL + "/search?" + params.Encode()
 
 		start := time.Now()
+		searchCtx, searchCancel := context.WithTimeout(r.Context(), time.Duration(cfg.SearchTimeoutMs)*time.Millisecond)
+		defer searchCancel()
 
 		results := make([]fanResult, cfg.FanOut)
 		var wg sync.WaitGroup
@@ -156,7 +176,7 @@ func searchHandler(cfg Config, client *http.Client) http.HandlerFunc {
 			wg.Add(1)
 			go func(idx int) {
 				defer wg.Done()
-				req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, searchURL, nil)
+				req, err := http.NewRequestWithContext(searchCtx, http.MethodGet, searchURL, nil)
 				if err != nil {
 					results[idx] = fanResult{err: err}
 					return

@@ -8,8 +8,10 @@ services:
       - SINGLE_LEAF_PORT=8081
       - SEARXNG_URL=http://searxng:8080
       - ZENPANDA_URL=http://zenpanda:9222
-      - DEEP_RENDER_COUNT=5
-      - DEEP_WAIT_MS=3000
+      - DEEP_RENDER_COUNT=10
+      - DEEP_WAIT_MS=1500
+      - DEEP_TIMEOUT_MS=10000
+      - SEARCH_TIMEOUT_MS=7000
     depends_on:
       tor-proxy:
         condition: service_healthy

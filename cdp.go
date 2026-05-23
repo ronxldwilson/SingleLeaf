@@ -55,6 +55,11 @@ func (c *CDPClient) FetchPage(ctx context.Context, targetURL string, waitMs int)
 	}
 	defer conn.Close()
 
+	go func() {
+		<-ctx.Done()
+		conn.Close()
+	}()
+
 	var msgID atomic.Int64
 
 	sendCmd := func(method string, params any, sessionID string) (json.RawMessage, error) {
@@ -104,7 +109,12 @@ func (c *CDPClient) FetchPage(ctx context.Context, targetURL string, waitMs int)
 		return "", fmt.Errorf("navigate: %w", err)
 	}
 
-	time.Sleep(time.Duration(waitMs) * time.Millisecond)
+	select {
+	case <-time.After(time.Duration(waitMs) * time.Millisecond):
+	case <-ctx.Done():
+		sendCmd("Target.closeTarget", map[string]string{"targetId": targetID}, "")
+		return "", ctx.Err()
+	}
 
 	result, err := sendCmd("Runtime.evaluate", map[string]any{
 		"expression":    "document.body ? document.body.innerText : ''",
@@ -198,40 +208,35 @@ func deepSearchHandler(cfg Config, client *http.Client, cdp *CDPClient) http.Han
 		searchURL := cfg.SearXNGURL + "/search?" + params
 		start := time.Now()
 
-		results := make([]fanResult, cfg.FanOut)
-		var wg sync.WaitGroup
-		for i := range cfg.FanOut {
-			wg.Add(1)
-			go func(idx int) {
-				defer wg.Done()
-				req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, searchURL, nil)
-				if err != nil {
-					results[idx] = fanResult{err: err}
-					return
-				}
-				req.Header.Set("Accept", "application/json")
-				resp, err := client.Do(req)
-				if err != nil {
-					results[idx] = fanResult{err: err}
-					return
-				}
-				defer resp.Body.Close()
-				body, err := io.ReadAll(resp.Body)
-				if err != nil {
-					results[idx] = fanResult{err: err}
-					return
-				}
-				var parsed SearXNGResponse
-				if err := json.Unmarshal(body, &parsed); err != nil {
-					results[idx] = fanResult{err: err}
-					return
-				}
-				results[idx] = fanResult{resp: &parsed}
-			}(i)
-		}
-		wg.Wait()
+		overallCtx, overallCancel := context.WithTimeout(r.Context(), time.Duration(cfg.DeepTimeoutMs)*time.Millisecond)
+		defer overallCancel()
 
-		merged := mergeResults(results, query)
+		searchDeadline := time.Duration(cfg.SearchTimeoutMs) * time.Millisecond
+		searchCtx, searchCancel := context.WithTimeout(overallCtx, searchDeadline)
+		defer searchCancel()
+
+		req, err := http.NewRequestWithContext(searchCtx, http.MethodGet, searchURL, nil)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create request"})
+			return
+		}
+		req.Header.Set("Accept", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "searxng request failed"})
+			return
+		}
+		defer resp.Body.Close()
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "failed to read searxng response"})
+			return
+		}
+		var merged SearXNGResponse
+		if err := json.Unmarshal(body, &merged); err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "invalid searxng response"})
+			return
+		}
 
 		toRender := merged.Results
 		if len(toRender) > renderCount {
@@ -239,6 +244,8 @@ func deepSearchHandler(cfg Config, client *http.Client, cdp *CDPClient) http.Han
 		}
 
 		deepResults := make([]DeepResult, len(toRender))
+		sem := make(chan struct{}, 2)
+
 		var renderWg sync.WaitGroup
 		for i, sr := range toRender {
 			deepResults[i] = DeepResult{
@@ -252,11 +259,16 @@ func deepSearchHandler(cfg Config, client *http.Client, cdp *CDPClient) http.Han
 			renderWg.Add(1)
 			go func(idx int, pageURL string) {
 				defer renderWg.Done()
+				select {
+				case sem <- struct{}{}:
+					defer func() { <-sem }()
+				case <-overallCtx.Done():
+					deepResults[idx].RenderError = "render deadline exceeded"
+					return
+				}
 				renderStart := time.Now()
-				ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-				defer cancel()
 
-				text, err := cdp.FetchPage(ctx, pageURL, cfg.DeepWaitMs)
+				text, err := cdp.FetchPage(overallCtx, pageURL, cfg.DeepWaitMs)
 				deepResults[idx].RenderTimeMs = time.Since(renderStart).Milliseconds()
 				if err != nil {
 					deepResults[idx].RenderError = err.Error()
