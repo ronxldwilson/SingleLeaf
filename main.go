@@ -19,7 +19,7 @@ type Config struct {
 	Port            string
 	SearXNGURL      string
 	FanOut          int
-	ZenPandaURL     string
+	Crawl4goURL     string
 	DeepRenderCount int
 	DeepWaitMs      int
 	DeepTimeoutMs   int
@@ -61,7 +61,7 @@ func loadConfig() Config {
 		Port:            getEnv("SINGLE_LEAF_PORT", "8081"),
 		SearXNGURL:      getEnv("SEARXNG_URL", "http://searxng:8080"),
 		FanOut:          fanOut,
-		ZenPandaURL:     getEnv("ZENPANDA_URL", "http://zenpanda:9222"),
+		Crawl4goURL:     getEnv("CRAWL4GO_URL", "http://crawl4go:8082"),
 		DeepRenderCount: renderCount,
 		DeepWaitMs:      waitMs,
 		DeepTimeoutMs:   deepTimeoutMs,
@@ -113,12 +113,12 @@ func main() {
 		Timeout: 90 * time.Second,
 	}
 
-	cdp := NewCDPClient(cfg.ZenPandaURL)
+	crawler := NewCrawl4goClient(cfg.Crawl4goURL)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", uiHandler)
 	mux.HandleFunc("/search", searchHandler(cfg, client))
-	mux.HandleFunc("/deep-search", deepSearchHandler(cfg, client, cdp))
+	mux.HandleFunc("/deep-search", deepSearchHandler(cfg, client, crawler))
 	mux.HandleFunc("/health", healthHandler)
 
 	slog.Info("single-leaf starting",
@@ -130,7 +130,7 @@ func main() {
 	)
 	slog.Info("upstream services",
 		"searxng", cfg.SearXNGURL,
-		"zenpanda", cfg.ZenPandaURL,
+		"crawl4go", cfg.Crawl4goURL,
 	)
 
 	if err := http.ListenAndServe(":"+cfg.Port, mux); err != nil {

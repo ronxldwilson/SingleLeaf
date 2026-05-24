@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -10,177 +11,79 @@ import (
 	"net/url"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
-
-	"regexp"
-
-	"github.com/gorilla/websocket"
 )
 
-var htmlTagRe = regexp.MustCompile(`<[^>]*>`)
-var whitespaceRe = regexp.MustCompile(`\s+`)
+type Crawl4goClient struct {
+	baseURL    string
+	httpClient *http.Client
+}
 
-func httpFetchText(ctx context.Context, client *http.Client, pageURL string) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pageURL, nil)
-	if err != nil {
-		return "", err
+func NewCrawl4goClient(baseURL string) *Crawl4goClient {
+	return &Crawl4goClient{
+		baseURL:    baseURL,
+		httpClient: &http.Client{Timeout: 30 * time.Second},
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; SingleLeaf/1.0)")
-	req.Header.Set("Accept", "text/html")
+}
 
-	resp, err := client.Do(req)
+type crawlRequest struct {
+	URL    string `json:"url"`
+	WaitMs int    `json:"wait_ms"`
+	Output string `json:"output"`
+	Prune  bool   `json:"prune"`
+}
+
+type crawlResponse struct {
+	URL          string `json:"url"`
+	StatusCode   int    `json:"status_code"`
+	Blocked      bool   `json:"blocked"`
+	BlockReason  string `json:"block_reason,omitempty"`
+	Content      string `json:"content"`
+	RenderTimeMs int64  `json:"render_time_ms"`
+	RenderSource string `json:"render_source"`
+}
+
+func (c *Crawl4goClient) CrawlPage(ctx context.Context, pageURL string, waitMs int) (crawlResponse, error) {
+	body, err := json.Marshal(crawlRequest{
+		URL:    pageURL,
+		WaitMs: waitMs,
+		Output: "text",
+		Prune:  false,
+	})
 	if err != nil {
-		return "", err
+		return crawlResponse{}, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/crawl", bytes.NewReader(body))
+	if err != nil {
+		return crawlResponse{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return crawlResponse{}, err
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 200_000))
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 500_000))
 	if err != nil {
-		return "", err
+		return crawlResponse{}, err
 	}
 
-	html := string(body)
-
-	// Remove script and style blocks
-	for _, tag := range []string{"script", "style", "noscript"} {
-		re := regexp.MustCompile(`(?is)<` + tag + `[^>]*>.*?</` + tag + `>`)
-		html = re.ReplaceAllString(html, " ")
+	if resp.StatusCode != http.StatusOK {
+		return crawlResponse{}, fmt.Errorf("crawl4go returned %d: %s", resp.StatusCode, string(respBody))
 	}
 
-	text := htmlTagRe.ReplaceAllString(html, " ")
-	text = whitespaceRe.ReplaceAllString(text, " ")
-	text = strings.TrimSpace(text)
-
-	return text, nil
+	var result crawlResponse
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return crawlResponse{}, err
+	}
+	return result, nil
 }
 
-type CDPClient struct {
-	zenPandaURL string
-	httpClient  *http.Client
-}
-
-func NewCDPClient(zenPandaURL string) *CDPClient {
-	return &CDPClient{
-		zenPandaURL: zenPandaURL,
-		httpClient:  &http.Client{Timeout: 10 * time.Second},
-	}
-}
-
-type cdpMessage struct {
-	ID        int             `json:"id"`
-	Method    string          `json:"method,omitempty"`
-	Params    json.RawMessage `json:"params,omitempty"`
-	Result    json.RawMessage `json:"result,omitempty"`
-	Error     *cdpError       `json:"error,omitempty"`
-	SessionID string          `json:"sessionId,omitempty"`
-}
-
-type cdpError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
-}
-
-func (c *CDPClient) browserWSURL() string {
-	u := strings.TrimPrefix(c.zenPandaURL, "http://")
-	u = strings.TrimPrefix(u, "https://")
-	return "ws://" + u + "/"
-}
-
-func (c *CDPClient) FetchPage(ctx context.Context, targetURL string, waitMs int) (string, error) {
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, c.browserWSURL(), nil)
-	if err != nil {
-		return "", fmt.Errorf("ws connect: %w", err)
-	}
-	defer conn.Close()
-
-	go func() {
-		<-ctx.Done()
-		conn.Close()
-	}()
-
-	var msgID atomic.Int64
-
-	sendCmd := func(method string, params any, sessionID string) (json.RawMessage, error) {
-		id := int(msgID.Add(1))
-		p, _ := json.Marshal(params)
-		msg := cdpMessage{ID: id, Method: method, Params: p, SessionID: sessionID}
-		if err := conn.WriteJSON(msg); err != nil {
-			return nil, err
-		}
-		for {
-			var resp cdpMessage
-			if err := conn.ReadJSON(&resp); err != nil {
-				return nil, err
-			}
-			if resp.ID == id {
-				if resp.Error != nil {
-					return nil, fmt.Errorf("cdp error %d: %s", resp.Error.Code, resp.Error.Message)
-				}
-				return resp.Result, nil
-			}
-		}
-	}
-
-	createResult, err := sendCmd("Target.createTarget", map[string]string{"url": "about:blank"}, "")
-	if err != nil {
-		return "", fmt.Errorf("create target: %w", err)
-	}
-	var created struct {
-		TargetID string `json:"targetId"`
-	}
-	json.Unmarshal(createResult, &created)
-	targetID := created.TargetID
-
-	attachResult, err := sendCmd("Target.attachToTarget", map[string]any{"targetId": targetID, "flatten": true}, "")
-	if err != nil {
-		sendCmd("Target.closeTarget", map[string]string{"targetId": targetID}, "")
-		return "", fmt.Errorf("attach target: %w", err)
-	}
-	var attached struct {
-		SessionID string `json:"sessionId"`
-	}
-	json.Unmarshal(attachResult, &attached)
-	sid := attached.SessionID
-
-	if _, err := sendCmd("Page.navigate", map[string]string{"url": targetURL}, sid); err != nil {
-		sendCmd("Target.closeTarget", map[string]string{"targetId": targetID}, "")
-		return "", fmt.Errorf("navigate: %w", err)
-	}
-
-	select {
-	case <-time.After(time.Duration(waitMs) * time.Millisecond):
-	case <-ctx.Done():
-		sendCmd("Target.closeTarget", map[string]string{"targetId": targetID}, "")
-		return "", ctx.Err()
-	}
-
-	result, err := sendCmd("Runtime.evaluate", map[string]any{
-		"expression":    "document.body ? document.body.innerText : ''",
-		"returnByValue": true,
-	}, sid)
-	if err != nil {
-		sendCmd("Target.closeTarget", map[string]string{"targetId": targetID}, "")
-		return "", fmt.Errorf("evaluate: %w", err)
-	}
-
-	var evalResult struct {
-		Result struct {
-			Value string `json:"value"`
-		} `json:"result"`
-	}
-	if err := json.Unmarshal(result, &evalResult); err != nil {
-		sendCmd("Target.closeTarget", map[string]string{"targetId": targetID}, "")
-		return "", err
-	}
-
-	sendCmd("Target.closeTarget", map[string]string{"targetId": targetID}, "")
-
-	return evalResult.Result.Value, nil
-}
-
-func (c *CDPClient) Healthy(ctx context.Context) bool {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.zenPandaURL+"/json/health", nil)
+func (c *Crawl4goClient) Healthy(ctx context.Context) bool {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/health", nil)
 	if err != nil {
 		return false
 	}
@@ -204,6 +107,7 @@ type DeepResult struct {
 	RenderTimeMs int64    `json:"render_time_ms"`
 	RenderSource string   `json:"render_source,omitempty"`
 	RenderError  string   `json:"render_error,omitempty"`
+	Blocked      bool     `json:"blocked,omitempty"`
 }
 
 type DeepSearchResponse struct {
@@ -214,7 +118,7 @@ type DeepSearchResponse struct {
 	ElapsedMs       int64        `json:"elapsed_ms"`
 }
 
-func deepSearchHandler(cfg Config, client *http.Client, cdp *CDPClient) http.HandlerFunc {
+func deepSearchHandler(cfg Config, client *http.Client, crawler *Crawl4goClient) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		query := r.URL.Query().Get("q")
 		if query == "" {
@@ -234,15 +138,15 @@ func deepSearchHandler(cfg Config, client *http.Client, cdp *CDPClient) http.Han
 		lang := r.URL.Query().Get("lang")
 		pageno := r.URL.Query().Get("pageno")
 
-		params := fmt.Sprintf("q=%s&format=json", urlEncode(query))
+		params := fmt.Sprintf("q=%s&format=json", url.QueryEscape(query))
 		if categories != "" {
-			params += "&categories=" + urlEncode(categories)
+			params += "&categories=" + url.QueryEscape(categories)
 		}
 		if lang != "" {
-			params += "&language=" + urlEncode(lang)
+			params += "&language=" + url.QueryEscape(lang)
 		}
 		if pageno != "" {
-			params += "&pageno=" + urlEncode(pageno)
+			params += "&pageno=" + url.QueryEscape(pageno)
 		}
 
 		searchURL := cfg.SearXNGURL + "/search?" + params
@@ -282,7 +186,6 @@ func deepSearchHandler(cfg Config, client *http.Client, cdp *CDPClient) http.Han
 			return
 		}
 
-		// Retry once if 0 results and we have enough time for retry + rendering
 		searchElapsed := time.Since(start)
 		remainingMs := int64(cfg.DeepTimeoutMs) - searchElapsed.Milliseconds()
 		if len(result.Results) == 0 && remainingMs > int64(cfg.SearchTimeoutMs) {
@@ -292,16 +195,12 @@ func deepSearchHandler(cfg Config, client *http.Client, cdp *CDPClient) http.Han
 			}
 		}
 
-		merged := *result
-
-		toRender := merged.Results
+		toRender := result.Results
 		if len(toRender) > renderCount {
 			toRender = toRender[:renderCount]
 		}
 
 		deepResults := make([]DeepResult, len(toRender))
-		cdpSem := make(chan struct{}, 2)
-
 		var renderWg sync.WaitGroup
 		for i, sr := range toRender {
 			deepResults[i] = DeepResult{
@@ -317,83 +216,26 @@ func deepSearchHandler(cfg Config, client *http.Client, cdp *CDPClient) http.Han
 				defer renderWg.Done()
 				renderStart := time.Now()
 
-				type fetchResult struct {
-					text   string
-					source string
-				}
-				resultCh := make(chan fetchResult, 2)
-
-				// HTTP fetch — fast, plain text extraction
-				go func() {
-					text, err := httpFetchText(overallCtx, client, pageURL)
-					if err != nil || len(strings.TrimSpace(text)) < 200 {
-						resultCh <- fetchResult{}
-						return
-					}
-					if len(text) > 50000 {
-						text = text[:50000]
-					}
-					resultCh <- fetchResult{text: text, source: "fetch"}
-				}()
-
-				// CDP render — slower but handles JS-rendered pages
-				go func() {
-					select {
-					case cdpSem <- struct{}{}:
-						defer func() { <-cdpSem }()
-					case <-overallCtx.Done():
-						resultCh <- fetchResult{}
-						return
-					}
-					text, err := cdp.FetchPage(overallCtx, pageURL, cfg.DeepWaitMs)
-					if err != nil || len(strings.TrimSpace(text)) < 50 {
-						resultCh <- fetchResult{}
-						return
-					}
-					if len(text) > 50000 {
-						text = text[:50000]
-					}
-					resultCh <- fetchResult{text: text, source: "cdp"}
-				}()
-
-				// Take whichever arrives first with good data
-				var best fetchResult
-				for received := 0; received < 2; received++ {
-					select {
-					case r := <-resultCh:
-						if r.text != "" && best.text == "" {
-							best = r
-							// If HTTP fetch won with enough content, don't wait for CDP
-							if r.source == "fetch" && len(r.text) >= 500 {
-								deepResults[idx].RenderTimeMs = time.Since(renderStart).Milliseconds()
-								deepResults[idx].PageText = r.text
-								deepResults[idx].RenderSource = r.source
-								return
-							}
-						}
-						// If CDP came back with more content, upgrade
-						if r.text != "" && r.source == "cdp" && len(r.text) > len(best.text) {
-							best = r
-						}
-					case <-overallCtx.Done():
-						deepResults[idx].RenderTimeMs = time.Since(renderStart).Milliseconds()
-						if best.text != "" {
-							deepResults[idx].PageText = best.text
-							deepResults[idx].RenderSource = best.source
-						} else {
-							deepResults[idx].RenderError = "render deadline exceeded"
-						}
-						return
-					}
-				}
-
+				resp, err := crawler.CrawlPage(overallCtx, pageURL, cfg.DeepWaitMs)
 				deepResults[idx].RenderTimeMs = time.Since(renderStart).Milliseconds()
-				if best.text != "" {
-					deepResults[idx].PageText = best.text
-					deepResults[idx].RenderSource = best.source
-				} else {
-					deepResults[idx].RenderError = "no usable content from fetch or render"
+
+				if err != nil {
+					deepResults[idx].RenderError = err.Error()
+					return
 				}
+
+				text := strings.TrimSpace(resp.Content)
+				if len(text) < 50 {
+					deepResults[idx].RenderError = "insufficient content"
+					return
+				}
+				if len(text) > 50000 {
+					text = text[:50000]
+				}
+
+				deepResults[idx].PageText = text
+				deepResults[idx].RenderSource = resp.RenderSource
+				deepResults[idx].Blocked = resp.Blocked
 			}(i, sr.URL)
 		}
 		renderWg.Wait()
@@ -408,7 +250,7 @@ func deepSearchHandler(cfg Config, client *http.Client, cdp *CDPClient) http.Han
 		elapsed := time.Since(start)
 		slog.Info("deep-search completed",
 			"query", query,
-			"search_results", len(merged.Results),
+			"search_results", len(result.Results),
 			"rendered_ok", rendered,
 			"rendered_total", len(toRender),
 			"elapsed_ms", elapsed.Milliseconds(),
@@ -416,14 +258,10 @@ func deepSearchHandler(cfg Config, client *http.Client, cdp *CDPClient) http.Han
 
 		writeJSON(w, http.StatusOK, DeepSearchResponse{
 			Query:           query,
-			TotalResults:    len(merged.Results),
+			TotalResults:    len(result.Results),
 			RenderedResults: rendered,
 			Results:         deepResults,
 			ElapsedMs:       elapsed.Milliseconds(),
 		})
 	}
-}
-
-func urlEncode(s string) string {
-	return url.QueryEscape(s)
 }

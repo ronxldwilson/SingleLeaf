@@ -7,7 +7,7 @@ services:
     environment:
       - SINGLE_LEAF_PORT=8081
       - SEARXNG_URL=http://searxng:8080
-      - ZENPANDA_URL=http://zenpanda:9222
+      - CRAWL4GO_URL=http://crawl4go:8082
       - DEEP_RENDER_COUNT=10
       - DEEP_WAIT_MS=1500
       - DEEP_TIMEOUT_MS=15000
@@ -17,8 +17,25 @@ services:
         condition: service_healthy
       searxng:
         condition: service_started
+      crawl4go:
+        condition: service_started
+    restart: unless-stopped
+
+  crawl4go:
+    image: ronxldwilson/crawl4go:latest
+    ports:
+      - "8082:8082"
+    environment:
+      - CRAWL4GO_PORT=8082
+      - ZENPANDA_URL=http://zenpanda:9222
+      - TOR_PROXY_URL=http://tor-proxy:3128
+      - MAX_CONCURRENT=4
+      - DEFAULT_WAIT_MS=1500
+    depends_on:
       zenpanda:
         condition: service_started
+      tor-proxy:
+        condition: service_healthy
     restart: unless-stopped
 
   zenpanda:
