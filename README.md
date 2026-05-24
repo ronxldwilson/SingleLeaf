@@ -17,7 +17,7 @@
 
 ---
 
-SingleLeaf is a Go service that fans out search queries through [SearXNG](https://github.com/searxng/searxng) across 40+ search engines, routing every request through a pool of 100 rotating Tor circuits. Results are deduplicated, scored, and optionally deep-rendered via a headless browser to extract full page text — all within a strict 10-second deadline.
+SingleLeaf is a Go service that fans out search queries through [SearXNG](https://github.com/searxng/searxng) across 40+ search engines, routing every request through a pool of 100 rotating Tor circuits. Results are deduplicated, scored, and optionally deep-rendered via [crawl4go](https://github.com/ronxldwilson/crawl4go) — which handles stealth browsing, anti-bot evasion, consent popup removal, and smart HTTP/CDP racing — to extract full page text.
 
 ## Quick Start
 
@@ -36,6 +36,7 @@ All images are published to Docker Hub with multi-arch support (amd64 + arm64):
 | Image | Description |
 |---|---|
 | [`ronxldwilson/single-leaf`](https://hub.docker.com/r/ronxldwilson/single-leaf) | Search aggregator + deep renderer |
+| [`ronxldwilson/crawl4go`](https://hub.docker.com/r/ronxldwilson/crawl4go) | Page crawling, stealth rendering, content extraction |
 | [`ronxldwilson/zenpanda`](https://hub.docker.com/r/ronxldwilson/zenpanda) | Headless Chromium browser (CDP) |
 | [`ronxldwilson/searxng-slim`](https://hub.docker.com/r/ronxldwilson/searxng-slim) | SearXNG metasearch engine |
 | [`ronxldwilson/tor-proxy-pool`](https://hub.docker.com/r/ronxldwilson/tor-proxy-pool) | Rotating Tor proxy pool |
@@ -50,17 +51,32 @@ services:
       - "8081:8081"
     environment:
       - SEARXNG_URL=http://searxng:8080
-      - ZENPANDA_URL=http://zenpanda:9222
+      - CRAWL4GO_URL=http://crawl4go:8082
       - DEEP_RENDER_COUNT=10
-      - DEEP_TIMEOUT_MS=10000
-      - SEARCH_TIMEOUT_MS=7000
+      - DEEP_TIMEOUT_MS=15000
+      - SEARCH_TIMEOUT_MS=8000
     depends_on:
       tor-proxy:
         condition: service_healthy
       searxng:
         condition: service_started
+      crawl4go:
+        condition: service_started
+    restart: unless-stopped
+
+  crawl4go:
+    image: ronxldwilson/crawl4go:latest
+    ports:
+      - "8082:8082"
+    environment:
+      - ZENPANDA_URL=http://zenpanda:9222
+      - TOR_PROXY_URL=http://tor-proxy:3128
+      - MAX_CONCURRENT=4
+    depends_on:
       zenpanda:
         condition: service_started
+      tor-proxy:
+        condition: service_healthy
     restart: unless-stopped
 
   zenpanda:
@@ -114,14 +130,20 @@ Client ──> SingleLeaf (:8081) ──[5x fan-out]──> SearXNG (:8080) ─�
                 │                                              100 Tor circuits
                 │                                             (rotating exit IPs)
                 │
-                └──[top 10 results]──> ZenPanda (:9222) ──> Render via CDP
+                └──[top 10 results]──> Crawl4go (:8082) ──> ZenPanda (:9222)
+                                        │                    (headless CDP)
+                                        ├── HTTP/CDP race
+                                        ├── stealth mode
+                                        ├── anti-bot detection
+                                        └── consent popup removal
 ```
 
 ### Services
 
 | Service | Image | Port | Role |
 |---|---|---|---|
-| **single-leaf** | `ronxldwilson/single-leaf` | 8081 | Query fan-out, deduplication, deep rendering |
+| **single-leaf** | `ronxldwilson/single-leaf` | 8081 | Query fan-out, deduplication, deep rendering orchestration |
+| **crawl4go** | `ronxldwilson/crawl4go` | 8082 | Page crawling with stealth rendering, HTTP/CDP racing, anti-bot detection (~15 MiB RAM) |
 | **zenpanda** | `ronxldwilson/zenpanda` | 9222 | Headless Chromium for page rendering (CDP) |
 | **searxng** | `ronxldwilson/searxng-slim` | 8080 | Metasearch engine (40+ engines) |
 | **tor-proxy** | `ronxldwilson/tor-proxy-pool` | 3128, 4444 | 100 rotating Tor circuits via SOCKS5 isolation |
@@ -136,10 +158,10 @@ Client ──> SingleLeaf (:8081) ──[5x fan-out]──> SearXNG (:8080) ─�
 
 ### How deep search works
 
-1. A single SearXNG request fetches results (within a 7s search timeout)
-2. The **top 10 results** are rendered in parallel through ZenPanda using the Chrome DevTools Protocol
-3. Full page text is extracted via `document.body.innerText`
-4. Everything completes within a **strict 10-second overall deadline** — partial results are returned if time runs out
+1. A single SearXNG request fetches results (within an 8s search timeout)
+2. The **top 10 results** are sent in parallel to **crawl4go** for rendering
+3. Crawl4go races an HTTP fetch against a CDP render for each URL, applies stealth mode (navigator overrides, consent popup dismissal, overlay removal), detects anti-bot blocks, and extracts clean page text
+4. Everything completes within a **15-second overall deadline** — partial results are returned if time runs out
 
 ### Deduplication logic
 
@@ -186,14 +208,33 @@ Returns `{"status": "ok"}`.
 
 | Variable | Default | Description |
 |---|---|---|
+**SingleLeaf:**
+
+| Variable | Default | Description |
+|---|---|---|
 | `SINGLE_LEAF_PORT` | `8081` | Listen port |
 | `SEARXNG_URL` | `http://searxng:8080` | SearXNG URL |
-| `ZENPANDA_URL` | `http://zenpanda:9222` | ZenPanda URL |
+| `CRAWL4GO_URL` | `http://crawl4go:8082` | Crawl4go URL |
 | `SINGLE_LEAF_FANOUT` | `5` | Parallel requests per search query |
 | `DEEP_RENDER_COUNT` | `10` | Top results to deep-render |
-| `DEEP_WAIT_MS` | `2000` | Page render wait time (ms) |
-| `DEEP_TIMEOUT_MS` | `10000` | Overall deep-search deadline (ms) |
-| `SEARCH_TIMEOUT_MS` | `7000` | Search phase timeout (ms) |
+| `DEEP_WAIT_MS` | `1500` | Page render wait time (ms) |
+| `DEEP_TIMEOUT_MS` | `15000` | Overall deep-search deadline (ms) |
+| `SEARCH_TIMEOUT_MS` | `8000` | Search phase timeout (ms) |
+
+**Crawl4go:**
+
+| Variable | Default | Description |
+|---|---|---|
+| `CRAWL4GO_PORT` | `8082` | Listen port |
+| `ZENPANDA_URL` | `http://zenpanda:9222` | Headless Chromium CDP endpoint |
+| `TOR_PROXY_URL` | `http://tor-proxy:3128` | Tor proxy for outbound requests |
+| `MAX_CONCURRENT` | `4` | Max concurrent CDP sessions |
+| `DEFAULT_WAIT_MS` | `1500` | Default page render wait (ms) |
+
+**Tor Proxy:**
+
+| Variable | Default | Description |
+|---|---|---|
 | `TOR_INSTANCES` | `100` | Tor circuits in the proxy pool |
 | `TOR_REBUILD_INTERVAL` | `1800` | Circuit rebuild interval (seconds) |
 
