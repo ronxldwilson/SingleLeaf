@@ -118,7 +118,7 @@ curl "http://localhost:8081/deep-search?q=hello+world"
 
 ## Architecture
 
-![Architecture Diagram](diagram.jpg)
+![Architecture Diagram](diagram.svg)
 
 ```
                                                       ┌──────────────┐
