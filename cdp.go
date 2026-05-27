@@ -95,19 +95,28 @@ func (c *Crawl4goClient) Healthy(ctx context.Context) bool {
 	return resp.StatusCode == http.StatusOK
 }
 
+type ExtractedInfo struct {
+	Phone   []string `json:"phone,omitempty"`
+	Email   []string `json:"email,omitempty"`
+	Address string   `json:"address,omitempty"`
+	GST     string   `json:"gst,omitempty"`
+	About   string   `json:"about,omitempty"`
+}
+
 type DeepResult struct {
-	URL          string   `json:"url"`
-	Title        string   `json:"title"`
-	Content      string   `json:"content"`
-	PageText     string   `json:"page_text"`
-	Engine       string   `json:"engine,omitempty"`
-	Engines      []string `json:"engines,omitempty"`
-	Score        float64  `json:"score"`
-	Category     string   `json:"category,omitempty"`
-	RenderTimeMs int64    `json:"render_time_ms"`
-	RenderSource string   `json:"render_source,omitempty"`
-	RenderError  string   `json:"render_error,omitempty"`
-	Blocked      bool     `json:"blocked,omitempty"`
+	URL          string        `json:"url"`
+	Title        string        `json:"title"`
+	Content      string        `json:"content"`
+	PageText     string        `json:"page_text"`
+	Extracted    *ExtractedInfo `json:"extracted,omitempty"`
+	Engine       string        `json:"engine,omitempty"`
+	Engines      []string      `json:"engines,omitempty"`
+	Score        float64       `json:"score"`
+	Category     string        `json:"category,omitempty"`
+	RenderTimeMs int64         `json:"render_time_ms"`
+	RenderSource string        `json:"render_source,omitempty"`
+	RenderError  string        `json:"render_error,omitempty"`
+	Blocked      bool          `json:"blocked,omitempty"`
 }
 
 type DeepSearchResponse struct {
@@ -119,7 +128,7 @@ type DeepSearchResponse struct {
 	ElapsedMs       int64              `json:"elapsed_ms"`
 }
 
-func deepSearchHandler(cfg Config, client *http.Client, crawler *Crawl4goClient, llm *LLMClient) http.HandlerFunc {
+func deepSearchHandler(cfg Config, client *http.Client, crawler *Crawl4goClient, llm *LLMClient, customSearch *CustomSearchClient) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		query := r.URL.Query().Get("q")
 		if query == "" {
@@ -181,19 +190,53 @@ func deepSearchHandler(cfg Config, client *http.Client, crawler *Crawl4goClient,
 			return &parsed, nil
 		}
 
-		result, err := doSearch()
-		if err != nil {
-			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "searxng request failed"})
-			return
+		var customResults []SearXNGResult
+		var searchWg sync.WaitGroup
+		var result *SearXNGResponse
+		var searchErr error
+
+		searchWg.Add(1)
+		go func() {
+			defer searchWg.Done()
+			result, searchErr = doSearch()
+			if searchErr == nil && len(result.Results) == 0 {
+				searchElapsed := time.Since(start)
+				remainingMs := int64(cfg.DeepTimeoutMs) - searchElapsed.Milliseconds()
+				if remainingMs > int64(cfg.SearchTimeoutMs) {
+					slog.Info("search returned 0 results, retrying", "query", query, "remaining_ms", remainingMs)
+					if retry, retryErr := doSearch(); retryErr == nil && len(retry.Results) > 0 {
+						result = retry
+					}
+				}
+			}
+		}()
+
+		if customSearch.cfg.Enabled {
+			searchWg.Add(1)
+			go func() {
+				defer searchWg.Done()
+				cr, err := customSearch.Search(overallCtx, query, 30)
+				if err != nil {
+					slog.Warn("deep-search custom search failed", "error", err)
+					return
+				}
+				customResults = cr
+			}()
 		}
 
-		searchElapsed := time.Since(start)
-		remainingMs := int64(cfg.DeepTimeoutMs) - searchElapsed.Milliseconds()
-		if len(result.Results) == 0 && remainingMs > int64(cfg.SearchTimeoutMs) {
-			slog.Info("search returned 0 results, retrying", "query", query, "remaining_ms", remainingMs)
-			if retry, err := doSearch(); err == nil && len(retry.Results) > 0 {
-				result = retry
-			}
+		searchWg.Wait()
+
+		if result == nil {
+			result = &SearXNGResponse{Query: query, Results: []SearXNGResult{}}
+		}
+
+		if len(customResults) > 0 {
+			result.Results = append(customResults, result.Results...)
+		}
+
+		if len(result.Results) == 0 {
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "all search requests failed"})
+			return
 		}
 
 		deepResults := make([]DeepResult, len(result.Results))
@@ -254,9 +297,9 @@ func deepSearchHandler(cfg Config, client *http.Client, crawler *Crawl4goClient,
 						defer extractWg.Done()
 						extractCtx, extractCancel := context.WithTimeout(overallCtx, time.Duration(cfg.LLM.TimeoutMs)*time.Millisecond)
 						defer extractCancel()
-						extracted, err := llm.ExtractContent(extractCtx, query, deepResults[idx].PageText)
-						if err == nil && extracted != "NOT_RELEVANT" {
-							deepResults[idx].PageText = extracted
+						_, info, _ := llm.ExtractContent(extractCtx, query, deepResults[idx].PageText)
+						if info != nil {
+							deepResults[idx].Extracted = info
 						}
 					}(i)
 				}

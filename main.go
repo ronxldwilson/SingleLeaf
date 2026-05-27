@@ -169,7 +169,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", uiHandler)
 	mux.HandleFunc("/search", searchHandler(cfg, client, llm, customSearch))
-	mux.HandleFunc("/deep-search", deepSearchHandler(cfg, client, crawler, llm))
+	mux.HandleFunc("/deep-search", deepSearchHandler(cfg, client, crawler, llm, customSearch))
 	mux.HandleFunc("/health", healthHandler)
 
 	slog.Info("single-leaf starting",
@@ -331,8 +331,8 @@ func searchHandler(cfg Config, client *http.Client, llm *LLMClient, customSearch
 			"elapsed_ms", elapsed.Milliseconds(),
 		)
 
-		if successCount == 0 {
-			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "all searxng requests failed"})
+		if successCount == 0 && len(merged.Results) == 0 {
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "all search requests failed"})
 			return
 		}
 

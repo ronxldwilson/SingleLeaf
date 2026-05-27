@@ -228,18 +228,26 @@ func (c *LLMClient) RerankResults(ctx context.Context, query string, results []S
 	return reranked
 }
 
-const defaultExtractPrompt = `You are a content extractor. Given a web page's raw text and the user's search query, extract the relevant information into a clean, structured summary.
+const defaultExtractPrompt = `You are a structured data extractor. Given a web page's raw text, extract business information into a JSON object.
 
 Rules:
-- Output a concise summary (under 500 words) of the page content relevant to the query
-- Include key facts: product names, prices, specifications, contact info, company details if present
-- Strip navigation, ads, footers, cookie notices, and other boilerplate
-- If the page is not relevant to the query, output "NOT_RELEVANT"
-- Do NOT make up information that isn't on the page`
+- Output ONLY valid JSON, no markdown, no explanation
+- Extract these fields:
+  {
+    "phone": ["list of phone numbers found"],
+    "email": ["list of email addresses found"],
+    "address": "physical address if found",
+    "gst": "GST/tax ID number if found (e.g. GSTIN, VAT, TIN)",
+    "about": "1-2 sentence company/page description relevant to the query"
+  }
+- Use empty string "" for missing text fields, empty array [] for missing list fields
+- Do NOT invent information — only extract what is actually on the page
+- Phone numbers should include country code if present (e.g. +91 98765 43210)
+- If page is not relevant or has no useful info, return all empty fields`
 
-func (c *LLMClient) ExtractContent(ctx context.Context, query, pageText string) (string, error) {
+func (c *LLMClient) ExtractContent(ctx context.Context, query, pageText string) (string, *ExtractedInfo, error) {
 	if !c.cfg.Enabled {
-		return pageText, nil
+		return pageText, nil, nil
 	}
 
 	if len(pageText) > 15000 {
@@ -254,16 +262,33 @@ func (c *LLMClient) ExtractContent(ctx context.Context, query, pageText string) 
 	userMsg := fmt.Sprintf("Query: %s\n\nPage text:\n%s", query, pageText)
 
 	start := time.Now()
-	extracted, err := c.complete(ctx, prompt, userMsg, 1000)
+	raw, err := c.complete(ctx, prompt, userMsg, 1000)
 	elapsed := time.Since(start).Milliseconds()
 
 	if err != nil {
 		slog.Warn("llm extract failed", "error", err, "elapsed_ms", elapsed)
-		return pageText, nil
+		return pageText, nil, nil
 	}
 
-	slog.Info("llm extract", "query", query, "input_len", len(pageText), "output_len", len(extracted), "elapsed_ms", elapsed)
-	return extracted, nil
+	raw = extractJSONObject(raw)
+
+	var info ExtractedInfo
+	if err := json.Unmarshal([]byte(raw), &info); err != nil {
+		slog.Warn("llm extract parse failed", "error", err, "raw", raw[:min(200, len(raw))])
+		return pageText, nil, nil
+	}
+
+	slog.Info("llm extract", "query", query, "phones", len(info.Phone), "emails", len(info.Email), "has_gst", info.GST != "", "elapsed_ms", elapsed)
+	return pageText, &info, nil
+}
+
+func extractJSONObject(s string) string {
+	start := strings.Index(s, "{")
+	end := strings.LastIndex(s, "}")
+	if start >= 0 && end > start {
+		return s[start : end+1]
+	}
+	return s
 }
 
 const defaultSynthesizePrompt = `You are a research assistant. Given a user's search query and a set of search results with their content, synthesize a comprehensive answer.
