@@ -111,14 +111,15 @@ type DeepResult struct {
 }
 
 type DeepSearchResponse struct {
-	Query           string       `json:"query"`
-	TotalResults    int          `json:"total_results"`
-	RenderedResults int          `json:"rendered_results"`
-	Results         []DeepResult `json:"results"`
-	ElapsedMs       int64        `json:"elapsed_ms"`
+	Query           string             `json:"query"`
+	TotalResults    int                `json:"total_results"`
+	RenderedResults int                `json:"rendered_results"`
+	Results         []DeepResult       `json:"results"`
+	Synthesis       *SynthesisResponse `json:"synthesis,omitempty"`
+	ElapsedMs       int64              `json:"elapsed_ms"`
 }
 
-func deepSearchHandler(cfg Config, client *http.Client, crawler *Crawl4goClient) http.HandlerFunc {
+func deepSearchHandler(cfg Config, client *http.Client, crawler *Crawl4goClient, llm *LLMClient) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		query := r.URL.Query().Get("q")
 		if query == "" {
@@ -244,12 +245,42 @@ func deepSearchHandler(cfg Config, client *http.Client, crawler *Crawl4goClient)
 			}
 		}
 
+		if cfg.LLM.Enabled {
+			var extractWg sync.WaitGroup
+			for i := range deepResults {
+				if deepResults[i].PageText != "" {
+					extractWg.Add(1)
+					go func(idx int) {
+						defer extractWg.Done()
+						extractCtx, extractCancel := context.WithTimeout(overallCtx, time.Duration(cfg.LLM.TimeoutMs)*time.Millisecond)
+						defer extractCancel()
+						extracted, err := llm.ExtractContent(extractCtx, query, deepResults[idx].PageText)
+						if err == nil && extracted != "NOT_RELEVANT" {
+							deepResults[idx].PageText = extracted
+						}
+					}(i)
+				}
+			}
+			extractWg.Wait()
+		}
+
+		var synthesis *SynthesisResponse
+		if cfg.LLM.Enabled && rendered > 0 {
+			synthCtx, synthCancel := context.WithTimeout(overallCtx, time.Duration(cfg.LLM.TimeoutMs)*time.Millisecond)
+			s, err := llm.Synthesize(synthCtx, query, deepResults)
+			synthCancel()
+			if err == nil {
+				synthesis = s
+			}
+		}
+
 		elapsed := time.Since(start)
 		slog.Info("deep-search completed",
 			"query", query,
 			"search_results", len(result.Results),
 			"rendered_ok", rendered,
 			"rendered_total", min(renderCount, len(result.Results)),
+			"synthesized", synthesis != nil,
 			"elapsed_ms", elapsed.Milliseconds(),
 		)
 
@@ -258,6 +289,7 @@ func deepSearchHandler(cfg Config, client *http.Client, crawler *Crawl4goClient)
 			TotalResults:    len(result.Results),
 			RenderedResults: rendered,
 			Results:         deepResults,
+			Synthesis:       synthesis,
 			ElapsedMs:       elapsed.Milliseconds(),
 		})
 	}

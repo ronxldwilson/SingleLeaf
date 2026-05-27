@@ -171,9 +171,9 @@ ui:
 #
 outgoing:
   # default timeout in seconds, can be override by engine
-  request_timeout: 5.0
+  request_timeout: 10.0
   # the maximum timeout in seconds
-  max_request_timeout: 6.0
+  max_request_timeout: 15.0
   # suffix of searxng_useragent, could contain information like an email address
   # to the administrator
   useragent_suffix: ""

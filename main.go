@@ -24,6 +24,8 @@ type Config struct {
 	DeepWaitMs      int
 	DeepTimeoutMs   int
 	SearchTimeoutMs int
+	LLM             LLMConfig
+	CustomSearch    CustomSearchConfig
 }
 
 func loadConfig() Config {
@@ -57,6 +59,51 @@ func loadConfig() Config {
 			searchTimeoutMs = n
 		}
 	}
+	llmTimeoutMs := 10000
+	if v := os.Getenv("LLM_TIMEOUT_MS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			llmTimeoutMs = n
+		}
+	}
+
+	apiKey := getEnv("LLM_API_KEY", "")
+	llmCfg := LLMConfig{
+		Enabled:          apiKey != "",
+		BaseURL:          getEnv("LLM_BASE_URL", "https://api.groq.com/openai/v1"),
+		APIKey:           apiKey,
+		Model:            getEnv("LLM_MODEL", "llama-3.3-70b-versatile"),
+		TimeoutMs:        llmTimeoutMs,
+		RewritePrompt:    getEnv("LLM_REWRITE_PROMPT", ""),
+		RerankPrompt:     getEnv("LLM_RERANK_PROMPT", ""),
+		ExtractPrompt:    getEnv("LLM_EXTRACT_PROMPT", ""),
+		SynthesizePrompt: getEnv("LLM_SYNTHESIZE_PROMPT", ""),
+	}
+
+	scoreMultiplier := 1.0
+	if v := os.Getenv("CUSTOM_SEARCH_SCORE_MULTIPLIER"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+			scoreMultiplier = f
+		}
+	}
+
+	customURL := getEnv("CUSTOM_SEARCH_URL", "")
+	customCfg := CustomSearchConfig{
+		Enabled:         customURL != "",
+		URL:             customURL,
+		APIKey:          getEnv("CUSTOM_SEARCH_API_KEY", ""),
+		APIKeyHeader:    getEnv("CUSTOM_SEARCH_API_KEY_HEADER", "X-API-Key"),
+		QueryParam:      getEnv("CUSTOM_SEARCH_QUERY_PARAM", "q"),
+		LimitParam:      getEnv("CUSTOM_SEARCH_LIMIT_PARAM", "limit"),
+		ResultsField:    getEnv("CUSTOM_SEARCH_RESULTS_FIELD", "results"),
+		URLField:        getEnv("CUSTOM_SEARCH_URL_FIELD", "url"),
+		TitleField:      getEnv("CUSTOM_SEARCH_TITLE_FIELD", "title"),
+		ContentField:    getEnv("CUSTOM_SEARCH_CONTENT_FIELD", "description"),
+		ScoreField:      getEnv("CUSTOM_SEARCH_SCORE_FIELD", "score"),
+		EngineName:      getEnv("CUSTOM_SEARCH_ENGINE_NAME", "custom"),
+		ScoreMultiplier: scoreMultiplier,
+		ExtraParams:     getEnv("CUSTOM_SEARCH_EXTRA_PARAMS", ""),
+	}
+
 	return Config{
 		Port:            getEnv("SINGLE_LEAF_PORT", "8081"),
 		SearXNGURL:      getEnv("SEARXNG_URL", "http://searxng:8080"),
@@ -66,6 +113,8 @@ func loadConfig() Config {
 		DeepWaitMs:      waitMs,
 		DeepTimeoutMs:   deepTimeoutMs,
 		SearchTimeoutMs: searchTimeoutMs,
+		LLM:             llmCfg,
+		CustomSearch:    customCfg,
 	}
 }
 
@@ -114,11 +163,13 @@ func main() {
 	}
 
 	crawler := NewCrawl4goClient(cfg.Crawl4goURL)
+	llm := NewLLMClient(cfg.LLM)
+	customSearch := NewCustomSearchClient(cfg.CustomSearch)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", uiHandler)
-	mux.HandleFunc("/search", searchHandler(cfg, client))
-	mux.HandleFunc("/deep-search", deepSearchHandler(cfg, client, crawler))
+	mux.HandleFunc("/search", searchHandler(cfg, client, llm, customSearch))
+	mux.HandleFunc("/deep-search", deepSearchHandler(cfg, client, crawler, llm))
 	mux.HandleFunc("/health", healthHandler)
 
 	slog.Info("single-leaf starting",
@@ -127,10 +178,14 @@ func main() {
 		"render_count", cfg.DeepRenderCount,
 		"wait_ms", cfg.DeepWaitMs,
 		"deep_timeout_ms", cfg.DeepTimeoutMs,
+		"llm_enabled", cfg.LLM.Enabled,
+		"custom_search", cfg.CustomSearch.Enabled,
 	)
 	slog.Info("upstream services",
 		"searxng", cfg.SearXNGURL,
 		"crawl4go", cfg.Crawl4goURL,
+		"llm", cfg.LLM.BaseURL,
+		"custom_search", cfg.CustomSearch.URL,
 	)
 
 	if err := http.ListenAndServe(":"+cfg.Port, mux); err != nil {
@@ -139,7 +194,7 @@ func main() {
 	}
 }
 
-func searchHandler(cfg Config, client *http.Client) http.HandlerFunc {
+func searchHandler(cfg Config, client *http.Client, llm *LLMClient, customSearch *CustomSearchClient) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		query := r.URL.Query().Get("q")
 		if query == "" {
@@ -151,8 +206,18 @@ func searchHandler(cfg Config, client *http.Client) http.HandlerFunc {
 		lang := r.URL.Query().Get("lang")
 		pageno := r.URL.Query().Get("pageno")
 
+		searchQuery := query
+		if cfg.LLM.Enabled {
+			rewriteCtx, rewriteCancel := context.WithTimeout(r.Context(), time.Duration(cfg.LLM.TimeoutMs)*time.Millisecond)
+			rewritten, _ := llm.RewriteQuery(rewriteCtx, query)
+			rewriteCancel()
+			if rewritten != query {
+				searchQuery = rewritten
+			}
+		}
+
 		params := url.Values{}
-		params.Set("q", query)
+		params.Set("q", searchQuery)
 		params.Set("format", "json")
 		if categories != "" {
 			params.Set("categories", categories)
@@ -171,6 +236,7 @@ func searchHandler(cfg Config, client *http.Client) http.HandlerFunc {
 		defer searchCancel()
 
 		results := make([]fanResult, cfg.FanOut)
+		var customResults []SearXNGResult
 		var wg sync.WaitGroup
 
 		for i := range cfg.FanOut {
@@ -205,9 +271,27 @@ func searchHandler(cfg Config, client *http.Client) http.HandlerFunc {
 				results[idx] = fanResult{resp: &parsed}
 			}(i)
 		}
+
+		if customSearch.cfg.Enabled {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				cr, err := customSearch.Search(searchCtx, query, 30)
+				if err != nil {
+					slog.Warn("custom search failed", "error", err)
+					return
+				}
+				customResults = cr
+			}()
+		}
+
 		wg.Wait()
 
 		merged := mergeResults(results, query)
+
+		if len(customResults) > 0 {
+			merged = mergeCustomResults(merged, customResults)
+		}
 
 		// Retry once with a single request if all fanout failed
 		successCount := 0
@@ -251,6 +335,14 @@ func searchHandler(cfg Config, client *http.Client) http.HandlerFunc {
 			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "all searxng requests failed"})
 			return
 		}
+
+		if cfg.LLM.Enabled && len(merged.Results) > 0 {
+			rerankCtx, rerankCancel := context.WithTimeout(r.Context(), time.Duration(cfg.LLM.TimeoutMs)*time.Millisecond)
+			merged.Results = llm.RerankResults(rerankCtx, query, merged.Results, 30)
+			rerankCancel()
+		}
+
+		merged.Query = query
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -338,6 +430,37 @@ func mergeResults(fanOutResults []fanResult, query string) SearXNGResponse {
 	applyDomainScoring(merged.Results)
 	sortResultsByScore(merged.Results)
 
+	merged.NumberOfResults = len(merged.Results)
+	return merged
+}
+
+func mergeCustomResults(merged SearXNGResponse, custom []SearXNGResult) SearXNGResponse {
+	seen := make(map[string]bool)
+	for _, r := range merged.Results {
+		seen[normalizeURL(r.URL)] = true
+	}
+
+	for _, r := range custom {
+		norm := normalizeURL(r.URL)
+		if seen[norm] {
+			for i := range merged.Results {
+				if normalizeURL(merged.Results[i].URL) == norm {
+					merged.Results[i].Score += r.Score
+					for _, eng := range r.Engines {
+						if !containsStr(merged.Results[i].Engines, eng) {
+							merged.Results[i].Engines = append(merged.Results[i].Engines, eng)
+						}
+					}
+					break
+				}
+			}
+		} else {
+			seen[norm] = true
+			merged.Results = append(merged.Results, r)
+		}
+	}
+
+	sortResultsByScore(merged.Results)
 	merged.NumberOfResults = len(merged.Results)
 	return merged
 }
