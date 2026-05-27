@@ -62,11 +62,19 @@ const uiHTML = `<!DOCTYPE html>
 
   .results { max-width: 680px; margin: 0 auto; padding: 0 20px 40px; }
 
+  .results-section-label {
+    font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 1px;
+    color: #555; margin: 24px 0 12px; padding-bottom: 8px; border-bottom: 1px solid #1a1a1a;
+  }
+  .results-section-label .count { color: #4a9; }
+
   .result-card {
     background: #141414; border: 1px solid #222; border-radius: 12px;
     padding: 18px; margin-bottom: 12px; transition: border-color 0.2s;
   }
   .result-card:hover { border-color: #333; }
+  .result-card.enriched { border-left: 3px solid #2d8a5e; }
+  .result-card.plain { opacity: 0.75; }
   .result-card .rank { font-size: 11px; color: #555; font-weight: 600; margin-bottom: 6px; }
   .result-card .title { font-size: 16px; font-weight: 600; margin-bottom: 4px; }
   .result-card .title a { color: #5cb88a; text-decoration: none; }
@@ -189,8 +197,21 @@ async function doSearch() {
 
     if (items.length === 0) {
       results.innerHTML = '<div class="empty"><p>No results found. Tor circuits may be slow — try again.</p></div>';
+    } else if (isDeep) {
+      const enriched = items.filter(r => r.page_text && r.page_text.length > 0);
+      const plain = items.filter(r => !r.page_text || r.page_text.length === 0);
+      let html = '';
+      if (enriched.length > 0) {
+        html += '<div class="results-section-label"><span class="count">' + enriched.length + '</span> enriched results</div>';
+        html += enriched.map((r, i) => renderCard(r, i, true, true)).join('');
+      }
+      if (plain.length > 0) {
+        html += '<div class="results-section-label"><span class="count">' + plain.length + '</span> additional results</div>';
+        html += plain.map((r, i) => renderCard(r, enriched.length + i, true, false)).join('');
+      }
+      results.innerHTML = html;
     } else {
-      results.innerHTML = items.map((r, i) => renderCard(r, i, isDeep)).join('');
+      results.innerHTML = items.map((r, i) => renderCard(r, i, false, false)).join('');
     }
   } catch (err) {
     results.innerHTML = '<div class="empty"><p>Request failed: ' + escHtml(err.message) + '</p></div>';
@@ -200,7 +221,7 @@ async function doSearch() {
   btn.disabled = false;
 }
 
-function renderCard(r, i, isDeep) {
+function renderCard(r, i, isDeep, isEnriched) {
   const hasText = r.page_text && r.page_text.length > 0;
   const snippet = r.content || (hasText ? r.page_text.substring(0, 250) : '');
   const textLen = r.page_text ? r.page_text.length : 0;
@@ -211,6 +232,9 @@ function renderCard(r, i, isDeep) {
   }
   if (r.score) {
     tags += '<span class="tag">score: ' + r.score.toFixed(1) + '</span>';
+  }
+  if (r.category) {
+    tags += '<span class="tag">' + escHtml(r.category) + '</span>';
   }
   if (isDeep) {
     if (r.render_source) {
@@ -223,6 +247,9 @@ function renderCard(r, i, isDeep) {
     if (r.render_error) {
       tags += '<span class="tag error">' + escHtml(r.render_error.substring(0, 40)) + '</span>';
     }
+    if (r.blocked) {
+      tags += '<span class="tag error">blocked</span>';
+    }
   }
 
   let pageTextSection = '';
@@ -232,7 +259,9 @@ function renderCard(r, i, isDeep) {
       + '<div class="page-text-content" id="' + id + '">' + escHtml(r.page_text.substring(0, 5000)) + (textLen > 5000 ? '\n\n... [truncated, ' + formatBytes(textLen) + ' total]' : '') + '</div>';
   }
 
-  return '<div class="result-card">'
+  const cardClass = isDeep ? (isEnriched ? 'result-card enriched' : 'result-card plain') : 'result-card';
+
+  return '<div class="' + cardClass + '">'
     + '<div class="rank">#' + (i + 1) + '</div>'
     + '<div class="title"><a href="' + escAttr(r.url) + '" target="_blank" rel="noopener">' + escHtml(r.title || r.url) + '</a></div>'
     + '<div class="url">' + escHtml(r.url) + '</div>'

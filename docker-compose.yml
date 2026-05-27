@@ -47,7 +47,7 @@ services:
   tor-proxy:
     image: ronxldwilson/tor-proxy-pool:latest
     environment:
-      - TOR_INSTANCES=100
+      - TOR_INSTANCES=500
       - TOR_REBUILD_INTERVAL=1800
     ports:
       - "3128:3128"

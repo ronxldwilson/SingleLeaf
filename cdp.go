@@ -195,14 +195,9 @@ func deepSearchHandler(cfg Config, client *http.Client, crawler *Crawl4goClient)
 			}
 		}
 
-		toRender := result.Results
-		if len(toRender) > renderCount {
-			toRender = toRender[:renderCount]
-		}
-
-		deepResults := make([]DeepResult, len(toRender))
+		deepResults := make([]DeepResult, len(result.Results))
 		var renderWg sync.WaitGroup
-		for i, sr := range toRender {
+		for i, sr := range result.Results {
 			deepResults[i] = DeepResult{
 				URL:      sr.URL,
 				Title:    sr.Title,
@@ -211,32 +206,34 @@ func deepSearchHandler(cfg Config, client *http.Client, crawler *Crawl4goClient)
 				Score:    sr.Score,
 				Category: sr.Category,
 			}
-			renderWg.Add(1)
-			go func(idx int, pageURL string) {
-				defer renderWg.Done()
-				renderStart := time.Now()
+			if i < renderCount {
+				renderWg.Add(1)
+				go func(idx int, pageURL string) {
+					defer renderWg.Done()
+					renderStart := time.Now()
 
-				resp, err := crawler.CrawlPage(overallCtx, pageURL, cfg.DeepWaitMs)
-				deepResults[idx].RenderTimeMs = time.Since(renderStart).Milliseconds()
+					resp, err := crawler.CrawlPage(overallCtx, pageURL, cfg.DeepWaitMs)
+					deepResults[idx].RenderTimeMs = time.Since(renderStart).Milliseconds()
 
-				if err != nil {
-					deepResults[idx].RenderError = err.Error()
-					return
-				}
+					if err != nil {
+						deepResults[idx].RenderError = err.Error()
+						return
+					}
 
-				text := strings.TrimSpace(resp.Content)
-				if len(text) < 50 {
-					deepResults[idx].RenderError = "insufficient content"
-					return
-				}
-				if len(text) > 50000 {
-					text = text[:50000]
-				}
+					text := strings.TrimSpace(resp.Content)
+					if len(text) < 50 {
+						deepResults[idx].RenderError = "insufficient content"
+						return
+					}
+					if len(text) > 50000 {
+						text = text[:50000]
+					}
 
-				deepResults[idx].PageText = text
-				deepResults[idx].RenderSource = resp.RenderSource
-				deepResults[idx].Blocked = resp.Blocked
-			}(i, sr.URL)
+					deepResults[idx].PageText = text
+					deepResults[idx].RenderSource = resp.RenderSource
+					deepResults[idx].Blocked = resp.Blocked
+				}(i, sr.URL)
+			}
 		}
 		renderWg.Wait()
 
@@ -252,7 +249,7 @@ func deepSearchHandler(cfg Config, client *http.Client, crawler *Crawl4goClient)
 			"query", query,
 			"search_results", len(result.Results),
 			"rendered_ok", rendered,
-			"rendered_total", len(toRender),
+			"rendered_total", min(renderCount, len(result.Results)),
 			"elapsed_ms", elapsed.Milliseconds(),
 		)
 

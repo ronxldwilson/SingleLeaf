@@ -335,11 +335,39 @@ func mergeResults(fanOutResults []fanResult, query string) SearXNGResponse {
 		merged.Results = append(merged.Results, *seen[u])
 	}
 
-	// Sort by accumulated score descending
+	applyDomainScoring(merged.Results)
 	sortResultsByScore(merged.Results)
 
 	merged.NumberOfResults = len(merged.Results)
 	return merged
+}
+
+var lowPriorityDomains = []string{
+	"indiamart.com", "dir.indiamart.com", "tradeindia.com",
+	"alibaba.com", "aliexpress.com", "made-in-china.com",
+	"globalsources.com", "thomasnet.com", "exportersindia.com",
+	"justdial.com", "sulekha.com", "yellowpages.com",
+	"dial4trade.com", "go4worldbusiness.com", "zauba.com",
+	"kompass.com", "tradewheel.com", "ec21.com", "ecplaza.net",
+	"wikipedia.org", "wikisource.org", "wiktionary.org",
+	"wikidata.org", "wikibooks.org", "wikiquote.org",
+	"cambridge.org", "merriam-webster.com", "dictionary.com",
+	"britannica.com", "bab.la", "linguee.com", "glosbe.com",
+	"indeed.com", "pinterest.com", "quora.com", "reddit.com",
+	"facebook.com", "instagram.com", "twitter.com", "x.com",
+	"linkedin.com", "openlibrary.org", "archive.org", "stason.org",
+}
+
+func applyDomainScoring(results []SearXNGResult) {
+	for i := range results {
+		norm := normalizeURL(results[i].URL)
+		for _, domain := range lowPriorityDomains {
+			if strings.Contains(norm, domain) {
+				results[i].Score *= 0.3
+				break
+			}
+		}
+	}
 }
 
 func sortResultsByScore(results []SearXNGResult) {

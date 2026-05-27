@@ -244,31 +244,59 @@ plugins:
     active: true
 
 
-# Configuration of the "Hostnames plugin":
-#
-# hostnames:
-#   replace:
-#     '(.*\.)?youtube\.com$': 'yt.example.com'
-#     '(.*\.)?youtu\.be$': 'yt.example.com'
-#     '(.*\.)?reddit\.com$': 'teddit.example.com'
-#     '(.*\.)?redd\.it$': 'teddit.example.com'
-#     '(www\.)?twitter\.com$': 'nitter.example.com'
-#   remove:
-#     - '(.*\.)?facebook.com$'
-#   low_priority:
-#     - '(.*\.)?google(\..*)?$'
-#   high_priority:
-#     - '(.*\.)?wikipedia.org$'
-#
-# Alternatively you can use external files for configuring the "Hostnames plugin":
-#
-# hostnames:
-#  replace: 'rewrite-hosts.yml'
-#
-# Content of 'rewrite-hosts.yml' (place the file in the same directory as 'settings.yml'):
-# '(.*\.)?youtube\.com$': 'yt.example.com'
-# '(.*\.)?youtu\.be$': 'yt.example.com'
-#
+hostnames:
+  low_priority:
+    # B2B directories / aggregators — push down so actual company sites rank higher
+    - '(.*\.)?indiamart\.com$'
+    - '(.*\.)?dir\.indiamart\.com$'
+    - '(.*\.)?tradeindia\.com$'
+    - '(.*\.)?alibaba\.com$'
+    - '(.*\.)?aliexpress\.com$'
+    - '(.*\.)?made-in-china\.com$'
+    - '(.*\.)?globalsources\.com$'
+    - '(.*\.)?thomasnet\.com$'
+    - '(.*\.)?exportersindia\.com$'
+    - '(.*\.)?justdial\.com$'
+    - '(.*\.)?sulekha\.com$'
+    - '(.*\.)?yellowpages\.com$'
+    - '(.*\.)?dial4trade\.com$'
+    - '(.*\.)?go4worldbusiness\.com$'
+    - '(.*\.)?zauba\.com$'
+    - '(.*\.)?kompass\.com$'
+    - '(.*\.)?dnb\.com$'
+    - '(.*\.)?hoovers\.com$'
+    - '(.*\.)?tradewheel\.com$'
+    - '(.*\.)?ec21\.com$'
+    - '(.*\.)?ecplaza\.net$'
+    # Encyclopedic / reference noise
+    - '(.*\.)?wikipedia\.org$'
+    - '(.*\.)?wikisource\.org$'
+    - '(.*\.)?wiktionary\.org$'
+    - '(.*\.)?wikidata\.org$'
+    - '(.*\.)?wikibooks\.org$'
+    - '(.*\.)?cambridge\.org$'
+    - '(.*\.)?merriam-webster\.com$'
+    - '(.*\.)?dictionary\.com$'
+    - '(.*\.)?britannica\.com$'
+    # Translation / language noise
+    - '(.*\.)?bab\.la$'
+    - '(.*\.)?linguee\.com$'
+    - '(.*\.)?glosbe\.com$'
+    - '(.*\.)?indeed\.com$'
+    - '(.*\.)?fr\.indeed\.com$'
+    # Generic social / content farms
+    - '(.*\.)?pinterest\.com$'
+    - '(.*\.)?quora\.com$'
+    - '(.*\.)?reddit\.com$'
+    - '(.*\.)?facebook\.com$'
+    - '(.*\.)?instagram\.com$'
+    - '(.*\.)?twitter\.com$'
+    - '(.*\.)?x\.com$'
+    - '(.*\.)?linkedin\.com$'
+    # Open library / academic
+    - '(.*\.)?openlibrary\.org$'
+    - '(.*\.)?archive\.org$'
+    - '(.*\.)?stason\.org$'
 
 
 categories_as_tabs:
