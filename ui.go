@@ -89,6 +89,28 @@ const uiHTML = `<!DOCTYPE html>
   .result-card .tag.source-cdp { color: #a94; border-color: #5a4a2a; }
   .result-card .tag.error { color: #c55; border-color: #5a2a2a; }
 
+  .extracted-info {
+    margin-top: 10px; padding: 12px; background: #0e1a14; border: 1px solid #1a3a2a;
+    border-radius: 8px; font-size: 13px; line-height: 1.7;
+  }
+  .extracted-info .info-row { display: flex; gap: 8px; margin-bottom: 4px; }
+  .extracted-info .info-label { color: #4a9; font-weight: 600; min-width: 60px; flex-shrink: 0; }
+  .extracted-info .info-value { color: #ccc; word-break: break-word; }
+  .extracted-info .info-value a { color: #5cb88a; text-decoration: none; }
+  .extracted-info .info-value a:hover { text-decoration: underline; }
+  .extracted-info .about { color: #999; font-style: italic; margin-top: 6px; }
+
+  .synthesis-card {
+    background: #0e1a14; border: 1px solid #2d8a5e; border-radius: 12px;
+    padding: 20px; margin-bottom: 20px;
+  }
+  .synthesis-card .synth-label {
+    font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px;
+    color: #4a9; margin-bottom: 10px;
+  }
+  .synthesis-card .synth-body { font-size: 14px; color: #ccc; line-height: 1.7; white-space: pre-wrap; word-break: break-word; }
+  .synthesis-card .synth-meta { margin-top: 12px; font-size: 11px; color: #555; }
+
   .page-text-toggle {
     margin-top: 10px; font-size: 12px; color: #4a9; cursor: pointer;
     background: none; border: none; padding: 0;
@@ -201,6 +223,9 @@ async function doSearch() {
       const enriched = items.filter(r => r.page_text && r.page_text.length > 0);
       const plain = items.filter(r => !r.page_text || r.page_text.length === 0);
       let html = '';
+      if (data.synthesis && data.synthesis.answer) {
+        html += renderSynthesis(data.synthesis);
+      }
       if (enriched.length > 0) {
         html += '<div class="results-section-label"><span class="count">' + enriched.length + '</span> enriched results</div>';
         html += enriched.map((r, i) => renderCard(r, i, true, true)).join('');
@@ -252,10 +277,36 @@ function renderCard(r, i, isDeep, isEnriched) {
     }
   }
 
+  let extractedSection = '';
+  if (r.extracted) {
+    const ex = r.extracted;
+    let rows = '';
+    if (ex.phone && ex.phone.length) {
+      const phones = ex.phone.map(p => '<a href="tel:' + escAttr(p.replace(/\s/g,'')) + '">' + escHtml(p) + '</a>').join(', ');
+      rows += '<div class="info-row"><span class="info-label">Phone</span><span class="info-value">' + phones + '</span></div>';
+    }
+    if (ex.email && ex.email.length) {
+      const emails = ex.email.map(e => '<a href="mailto:' + escAttr(e) + '">' + escHtml(e) + '</a>').join(', ');
+      rows += '<div class="info-row"><span class="info-label">Email</span><span class="info-value">' + emails + '</span></div>';
+    }
+    if (ex.address) {
+      rows += '<div class="info-row"><span class="info-label">Address</span><span class="info-value">' + escHtml(ex.address) + '</span></div>';
+    }
+    if (ex.gst) {
+      rows += '<div class="info-row"><span class="info-label">GST</span><span class="info-value">' + escHtml(ex.gst) + '</span></div>';
+    }
+    if (ex.about) {
+      rows += '<div class="about">' + escHtml(ex.about) + '</div>';
+    }
+    if (rows) {
+      extractedSection = '<div class="extracted-info">' + rows + '</div>';
+    }
+  }
+
   let pageTextSection = '';
   if (hasText) {
     const id = 'pt-' + i;
-    pageTextSection = '<button class="page-text-toggle" onclick="toggleText(\'' + id + '\', this)">Show extracted text (' + formatBytes(textLen) + ')</button>'
+    pageTextSection = '<button class="page-text-toggle" onclick="toggleText(\'' + id + '\', this)">Show raw page text (' + formatBytes(textLen) + ')</button>'
       + '<div class="page-text-content" id="' + id + '">' + escHtml(r.page_text.substring(0, 5000)) + (textLen > 5000 ? '\n\n... [truncated, ' + formatBytes(textLen) + ' total]' : '') + '</div>';
   }
 
@@ -267,7 +318,16 @@ function renderCard(r, i, isDeep, isEnriched) {
     + '<div class="url">' + escHtml(r.url) + '</div>'
     + (snippet ? '<div class="snippet">' + escHtml(snippet.substring(0, 300)) + '</div>' : '')
     + '<div class="meta">' + tags + '</div>'
+    + extractedSection
     + pageTextSection
+    + '</div>';
+}
+
+function renderSynthesis(synth) {
+  return '<div class="synthesis-card">'
+    + '<div class="synth-label">AI Answer</div>'
+    + '<div class="synth-body">' + escHtml(synth.answer) + '</div>'
+    + '<div class="synth-meta">' + escHtml(synth.model) + ' · ' + synth.elapsed_ms + 'ms · ' + synth.sources.length + ' sources</div>'
     + '</div>';
 }
 
